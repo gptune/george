@@ -69,7 +69,8 @@ class HODLRSolver(BasicSolver):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_computed"] = False
-        del state["solver"]
+        if "solver" in state:
+            del state["solver"]
         return state
 
     def __setstate__(self, state):

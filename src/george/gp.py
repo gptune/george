@@ -6,6 +6,7 @@ __all__ = ["GP"]
 
 import warnings
 import numpy as np
+import copy
 from scipy.linalg import LinAlgError
 
 from . import kernels
@@ -463,6 +464,14 @@ class GP(ModelSet):
         l = len(self.kernel)
         if l:
             Kg = self.kernel.get_gradient(self._x)
+            
+            
+            # Kg_save = copy.deepcopy(Kg)
+            # x1_x2=self._x[0][0]-self._x[1][0]
+            # l=np.exp(self.parameter_vector[3])
+            # l2=x1_x2*x1_x2/2/l/l    
+            # print('ddd',Kg[0,1,0],Kg[0,1,1],np.exp(self.parameter_vector[2])*np.exp(-l2),np.exp(self.parameter_vector[2])*np.exp(-l2)*l2)
+
             grad[n : n + l] = 0.5 * np.einsum("ijk,ij", Kg, A)
 
         return grad

@@ -4,7 +4,7 @@
 #include <cmath>
 #include <random>
 #include <vector>
-
+#include <iostream>
 #include <Eigen/Dense>
 
 namespace george {
@@ -53,7 +53,8 @@ public:
       rank_ = low_rank_approx(start+half, size-half, start, half, tol, random, U_[1], V_[0]);
       U_[0] = V_[0];
       V_[1] = U_[1];
-
+      if(parent_==NULL)
+          std::cout<<"top-level rank: "<<rank_<<std::endl;
       // Build the children
       children_[0] = new Node<KernelType>(
           diag_, kernel_, start_, half, min_size, tol, random, 0, this);
