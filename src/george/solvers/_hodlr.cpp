@@ -25,6 +25,11 @@ class SolverMatrix {
       if (i < 0 || i >= t_.rows() || j < 0 || j >= t_.rows()) {
         throw std::out_of_range("attempting to index outside of the dimension of the input coordinates");
       }
+
+      // double hp0 = kernel_->get_parameter(0);
+      // double hp1 = kernel_->get_parameter(1);
+      // std::cout<<"variance: "<<hp0<<" lengthscale: "<<hp1<<std::endl;
+
       return kernel_->value(t_.row(i).data(), t_.row(j).data());
     };
 
@@ -56,7 +61,7 @@ public:
       const py::object& kernel_spec,
       const py::array_t<double>& x,
       const py::array_t<double>& yerr,
-      int min_size = 100, double tol = 0.1, int seed = 0
+      int min_size = 100, double tol = 0.1, double tol_abs = 1e-10, int seed = 0
   ) {
     computed_ = 0;
     kernel_ = george::parse_kernel_spec(kernel_spec);
@@ -83,7 +88,7 @@ public:
     // Set up the solver object.
     if (solver_ != NULL) delete solver_;
     solver_ = new george::hodlr::Node<SolverMatrix> (
-        diag, matrix_, 0, n, min_size, tol, random);
+        diag, matrix_, 0, n, min_size, tol, tol_abs, random);
     solver_->compute();
     log_det_ = solver_->log_determinant();
 
@@ -145,13 +150,19 @@ Args:
         when reconstructing the off-diagonal blocks. Smaller values of ``tol``
         will generally give more accurate results with higher computational
         cost. (default: ``0.1``)
+    tol_abs (Optional[float]): The absolute precision tolerance for the low-rank
+        approximation. This value is used as an approximate limit on the
+        Frobenius norm between the low-rank approximation and the true matrix
+        when reconstructing the off-diagonal blocks. Smaller values of ``tol_abs``
+        will generally give more accurate results with higher computational
+        cost. (default: ``1e-10``)        
     seed (Optional[int]): The low-rank approximation method within the HODLR
         algorithm is not deterministic and, without a fixed seed, the method
         can give different results for the same matrix. Therefore, we require
         that the user provide a seed for the random number generator.
         (default: ``42``, obviously)
 )delim",
-    py::arg("kernel_spec"), py::arg("x"), py::arg("yerr"), py::arg("min_size") = 100, py::arg("tol") = 0.1, py::arg("seed") = 42
+    py::arg("kernel_spec"), py::arg("x"), py::arg("yerr"), py::arg("min_size") = 100, py::arg("tol") = 0.1,py::arg("tol_abs") = 1e-10, py::arg("seed") = 42
   );
   solver.def("apply_inverse", [](Solver& self, Eigen::MatrixXd& x, bool in_place = false){
     if (in_place) {

@@ -6,6 +6,8 @@
 #include <vector>
 #include <iostream>
 #include <Eigen/Dense>
+#include <fstream>
+#include <Eigen/SVD>
 
 namespace george {
   namespace hodlr {
@@ -32,6 +34,7 @@ public:
         int size,
         int min_size,
         double tol,
+        double tol_abs,
         std::mt19937& random,
         int direction = 0,
         Node<KernelType>* parent = NULL)
@@ -50,16 +53,39 @@ public:
       is_leaf_ = false;
 
       // Low-rank approximation
-      rank_ = low_rank_approx(start+half, size-half, start, half, tol, random, U_[1], V_[0]);
+      rank_ = low_rank_approx(start+half, size-half, start, half, tol, tol_abs, random, U_[1], V_[0]);
       U_[0] = V_[0];
       V_[1] = U_[1];
       if(parent_==NULL)
           std::cout<<"top-level rank: "<<rank_<<std::endl;
+
+      if(rank_==half){
+        Eigen::MatrixXd S;
+        S = get_exact_matrix();
+
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd(S, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        Eigen::VectorXd singular_values = svd.singularValues();
+        std::cout << "Singular values of S are:\n" << singular_values << std::endl;
+
+        std::ofstream file("fullmat.csv");
+        for (int i = 0; i < S.rows(); ++i) {
+            for (int j = 0; j < S.cols(); ++j) {
+                file << S(i, j);
+                if (j < S.cols() - 1)
+                    file << ", ";  
+            }
+            file << "\n";
+        }
+        file.close();
+        std::cout << "Full-rank block dumped to fullmat.csv.\n" << std::endl;
+        exit(0);
+      }
+
       // Build the children
       children_[0] = new Node<KernelType>(
-          diag_, kernel_, start_, half, min_size, tol, random, 0, this);
+          diag_, kernel_, start_, half, min_size, tol, tol_abs, random, 0, this);
       children_[1] = new Node<KernelType>(
-          diag_, kernel_, start_+half, size_-half, min_size, tol, random, 1, this);
+          diag_, kernel_, start_+half, size_-half, min_size, tol, tol_abs, random, 1, this);
 
     } else {
       is_leaf_ = true;
@@ -139,6 +165,7 @@ private:
                        int start_col,
                        int n_cols,
                        double tol,
+                       double tol_abs,
                        std::mt19937& random,
                        Eigen::MatrixXd& U_out,
                        Eigen::MatrixXd& V_out) const
@@ -151,7 +178,10 @@ private:
 
     // Setup
     int rank = 0;
-    double norm = 0.0, tol2 = tol * tol;
+    int ntry = 0;
+    int qrsvd = 0;
+    double norm = 0.0, tol2 = tol * tol, tol_abs2 = tol_abs * tol_abs;
+    double smallval = 1e-14;
     std::vector<int> index(n_rows);
     for (int n = 0; n < n_rows; ++n) index[n] = n;
 
@@ -189,7 +219,9 @@ private:
         V.col(rank) -= U.row(i).head(rank) * V.block(0, 0, n_cols, rank).transpose();
         V.col(rank).cwiseAbs().maxCoeff(&j);
 
-      } while (std::abs(V(j, rank)) < 1e-14);
+      // } while (std::abs(V(j, rank)) < smallval);
+      } while (std::abs(V(j, rank)) < smallval && ++ntry<10);
+      if(std::abs(V(j, rank)) < smallval) break;
 
       // Normalize
       V.col(rank) /= V(j, rank);
@@ -205,7 +237,8 @@ private:
 
       // Only update if this is a substantial change
       double rowcol_norm = U.col(rank-1).squaredNorm() * V.col(rank-1).squaredNorm();
-      if (rowcol_norm < tol2 * norm) break;
+      // std::cout<< rank << " "<< rowcol_norm << " "<< tol2 * norm  << " "<< tol_abs2<<std::endl;
+      if (rowcol_norm < tol2 * norm || rowcol_norm < tol_abs2) break;
 
       // Update the estimate of the norm
       norm += rowcol_norm;
@@ -215,8 +248,50 @@ private:
       }
     }
 
-    U_out = U.block(0, 0, n_rows, rank);
-    V_out = V.block(0, 0, n_cols, rank);
+    if(rank==0)rank=1;
+
+    if(qrsvd==1){
+      // QR-SVD
+      Eigen::MatrixXd Utmp = U.block(0, 0, n_rows, rank);
+      Eigen::MatrixXd Vtmp = V.block(0, 0, n_cols, rank);
+      Eigen::HouseholderQR<Eigen::MatrixXd> qru(Utmp);
+      Eigen::MatrixXd Qu = qru.householderQ() * Eigen::MatrixXd::Identity(Utmp.rows(), Utmp.cols());
+      Eigen::MatrixXd Ru = qru.matrixQR().triangularView<Eigen::Upper>();
+      Eigen::HouseholderQR<Eigen::MatrixXd> qrv(Vtmp);
+      Eigen::MatrixXd Qv = qrv.householderQ() * Eigen::MatrixXd::Identity(Vtmp.rows(), Vtmp.cols());
+      Eigen::MatrixXd Rv = qrv.matrixQR().triangularView<Eigen::Upper>();
+      Eigen::MatrixXd RuRv = Ru * Rv.transpose();
+
+      // Compute the full SVD of RuRv
+      Eigen::JacobiSVD<Eigen::MatrixXd> svd(RuRv, Eigen::ComputeFullU | Eigen::ComputeFullV);
+      Eigen::VectorXd singularValues = svd.singularValues();
+      // Determine the truncation threshold
+      double maxSingularValue = singularValues(0);  // Assuming the singular values are sorted in descending order
+      double threshold = std::max(tol * maxSingularValue, tol_abs);
+      // Count significant singular values
+      int ranknew = 0;
+      for (int i = 0; i < singularValues.size(); ++i) {
+          if (singularValues(i) > threshold)
+              ranknew++;
+          else
+              break;
+      }
+      ranknew = std::max(ranknew,1);
+      rank = ranknew;
+      // Construct the truncated matrices
+      Eigen::MatrixXd U_truncated = svd.matrixU().leftCols(rank);
+      Eigen::MatrixXd V_truncated = svd.matrixV().leftCols(rank);
+      Eigen::VectorXd Sigma_truncated = singularValues.head(rank);
+
+      // Optionally, construct the diagonal matrix for Sigma
+      Eigen::MatrixXd Sigma_diag = Sigma_truncated.asDiagonal();
+
+      U_out = Utmp* U_truncated* Sigma_diag;
+      V_out = Vtmp * V_truncated.transpose();
+    }else{
+      U_out = U.block(0, 0, n_rows, rank);
+      V_out = V.block(0, 0, n_cols, rank);
+    }
 
     return rank;
   };
