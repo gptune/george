@@ -61,7 +61,7 @@ public:
       const py::object& kernel_spec,
       const py::array_t<double>& x,
       const py::array_t<double>& yerr,
-      int min_size = 100, double tol = 0.1, double tol_abs = 1e-10, int seed = 0
+      int min_size = 100, double tol = 0.1, double tol_abs = 1e-10, int verbose = 0, int seed = 0
   ) {
     computed_ = 0;
     kernel_ = george::parse_kernel_spec(kernel_spec);
@@ -88,7 +88,7 @@ public:
     // Set up the solver object.
     if (solver_ != NULL) delete solver_;
     solver_ = new george::hodlr::Node<SolverMatrix> (
-        diag, matrix_, 0, n, min_size, tol, tol_abs, random);
+        diag, matrix_, 0, n, min_size, tol, tol_abs, verbose, random);
     solver_->compute();
     log_det_ = solver_->log_determinant();
 
@@ -155,14 +155,15 @@ Args:
         Frobenius norm between the low-rank approximation and the true matrix
         when reconstructing the off-diagonal blocks. Smaller values of ``tol_abs``
         will generally give more accurate results with higher computational
-        cost. (default: ``1e-10``)        
+        cost. (default: ``1e-10``)       
+    verbose (Optional[int]): The verbosity level. 
     seed (Optional[int]): The low-rank approximation method within the HODLR
         algorithm is not deterministic and, without a fixed seed, the method
         can give different results for the same matrix. Therefore, we require
         that the user provide a seed for the random number generator.
         (default: ``42``, obviously)
 )delim",
-    py::arg("kernel_spec"), py::arg("x"), py::arg("yerr"), py::arg("min_size") = 100, py::arg("tol") = 0.1,py::arg("tol_abs") = 1e-10, py::arg("seed") = 42
+    py::arg("kernel_spec"), py::arg("x"), py::arg("yerr"), py::arg("min_size") = 100, py::arg("tol") = 0.1,py::arg("tol_abs") = 1e-10, py::arg("verbose") = 1, py::arg("seed") = 42
   );
   solver.def("apply_inverse", [](Solver& self, Eigen::MatrixXd& x, bool in_place = false){
     if (in_place) {

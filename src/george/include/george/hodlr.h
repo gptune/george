@@ -35,6 +35,7 @@ public:
         int min_size,
         double tol,
         double tol_abs,
+        int verbose,
         std::mt19937& random,
         int direction = 0,
         Node<KernelType>* parent = NULL)
@@ -56,7 +57,7 @@ public:
       rank_ = low_rank_approx(start+half, size-half, start, half, tol, tol_abs, random, U_[1], V_[0]);
       U_[0] = V_[0];
       V_[1] = U_[1];
-      if(parent_==NULL)
+      if(parent_==NULL && verbose==1)
           std::cout<<"top-level rank: "<<rank_<<std::endl;
 
       if(rank_==half){
@@ -83,9 +84,9 @@ public:
 
       // Build the children
       children_[0] = new Node<KernelType>(
-          diag_, kernel_, start_, half, min_size, tol, tol_abs, random, 0, this);
+          diag_, kernel_, start_, half, min_size, tol, tol_abs, verbose, random, 0, this);
       children_[1] = new Node<KernelType>(
-          diag_, kernel_, start_+half, size_-half, min_size, tol, tol_abs, random, 1, this);
+          diag_, kernel_, start_+half, size_-half, min_size, tol, tol_abs, verbose, random, 1, this);
 
     } else {
       is_leaf_ = true;
