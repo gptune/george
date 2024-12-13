@@ -40,23 +40,33 @@ class HODLRSolver(BasicSolver):
         (default: ``42``)
     """
 
-    def __init__(self, kernel, min_size=100, tol=0.1, tol_abs=1e-10, verbose=0, seed=42):
+    def __init__(self, kernel, min_size=100, tol=0.1, tol_abs=1e-10, verbose=0, debug=0, compress_grad=0, sym=0, knn=0, seed=42):
         self.min_size = min_size
         self.tol = tol
         self.tol_abs = tol_abs
         self.verbose = verbose
+        self.debug = debug
+        self.compress_grad = compress_grad
         self.seed = seed
+        self.sym = sym
+        self.knn = knn
         super(HODLRSolver, self).__init__(kernel)
 
-    def compute(self, x, yerr):
+    def compute(self, x, nns, yerr):
         self.solver = HODLRSolverInterface()
-        self.solver.compute(self.kernel, x, yerr,
-                            self.min_size, self.tol, self.tol_abs, self.verbose, self.seed)
+        self.solver.compute(self.kernel, x, nns, yerr,
+                            self.min_size, self.tol, self.tol_abs, self.verbose, self.debug, self.compress_grad, self.sym, self.knn, self.seed)
         self._log_det = self.solver.log_determinant
         self.computed = self.solver.computed
 
     def apply_inverse(self, y, in_place=False):
         return self.solver.apply_inverse(y, in_place=in_place)
+
+    def apply_inverse_sym_W(self, y, in_place=False):
+        return self.solver.apply_inverse_sym_W(y, in_place=in_place)
+
+    def apply_inverse_sym_W_transpose(self, y, in_place=False):
+        return self.solver.apply_inverse_sym_W_transpose(y, in_place=in_place)
 
     def dot_solve(self, y):
         return self.solver.dot_solve(y)
@@ -67,6 +77,13 @@ class HODLRSolver(BasicSolver):
 
     def get_inverse(self):
         return self.solver.get_inverse()
+
+    def get_full(self,i):
+        return self.solver.get_full(i)
+
+    def apply_forward(self,x,i):
+        return self.solver.apply_forward(x,i)
+
 
     def __getstate__(self):
         state = self.__dict__.copy()

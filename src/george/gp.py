@@ -10,7 +10,7 @@ import copy
 from scipy.linalg import LinAlgError
 
 from . import kernels
-from .solvers import TrivialSolver, BasicSolver
+from .solvers import TrivialSolver, BasicSolver, HODLRSolver
 from .modeling import ModelSet, ConstantModel
 from .utils import multivariate_gaussian_samples, nd_sort_samples
 
@@ -301,7 +301,7 @@ class GP(ModelSet):
             b = self.solver.apply_inverse(r, in_place=True)
         return b
 
-    def compute(self, x, yerr=0.0, **kwargs):
+    def compute(self, x, nns, yerr=0.0, **kwargs):
         """
         Pre-compute the covariance matrix and factorize it for a set of times
         and uncertainties.
@@ -317,6 +317,7 @@ class GP(ModelSet):
         """
         # Parse the input coordinates and ensure the right memory layout.
         self._x = self.parse_samples(x)
+        self._nns = nns
         self._x = np.ascontiguousarray(self._x, dtype=np.float64)
         try:
             self._yerr2 = float(yerr) ** 2 * np.ones(len(x))
@@ -329,11 +330,12 @@ class GP(ModelSet):
 
         # Include the white noise term.
         yerr = np.sqrt(self._yerr2 + np.exp(self._call_white_noise(self._x)))
-        self.solver.compute(self._x, yerr, **kwargs)
+        self.solver.compute(self._x, self._nns, yerr, **kwargs)
 
         self._const = -0.5 * (
             len(self._x) * np.log(2 * np.pi) + self.solver.log_determinant
         )
+        # print("logdet: ",self.solver.log_determinant)
         self.computed = True
         self._alpha = None
 
@@ -353,7 +355,7 @@ class GP(ModelSet):
             try:
                 # Update the model making sure that we store the original
                 # ordering of the points.
-                self.compute(self._x, np.sqrt(self._yerr2), **kwargs)
+                self.compute(self._x, self._nns, np.sqrt(self._yerr2), **kwargs)
             except (ValueError, LinAlgError):
                 if quiet:
                     return False
@@ -433,13 +435,16 @@ class GP(ModelSet):
                 return np.zeros(len(self), dtype=np.float64)
             raise
 
-        if len(self.white_noise) or len(self.kernel):
-            K_inv = self.solver.get_inverse()
-            A = np.einsum("i,j", alpha, alpha) - K_inv
+
+        if(self.solver_type is not HODLRSolver or self.solver_kwargs['debug']==1):
+            if len(self.white_noise) or len(self.kernel):
+                K_inv = self.solver.get_inverse()
+                A = np.einsum("i,j", alpha, alpha) - K_inv
 
         # Compute each component of the gradient.
         grad = np.empty(len(self))
-        n = 0
+        n_mean = 0
+        nvec = 10    
 
         l = len(self.mean)
         if l:
@@ -449,30 +454,114 @@ class GP(ModelSet):
                 if quiet:
                     return np.zeros(len(self), dtype=np.float64)
                 raise
-            grad[n : n + l] = np.dot(mu, alpha)
-            n += l
+            grad[n_mean : n_mean + l] = np.dot(mu, alpha)
+        n_wn = n_mean + l
 
         l = len(self.white_noise)
         if l:
             wn = self._call_white_noise(self._x)
             wng = self._call_white_noise_gradient(self._x)
-            grad[n : n + l] = 0.5 * np.sum(
-                (np.exp(wn) * np.diag(A))[None, :] * wng, axis=1
-            )
-            n += l
+            if(self.solver_type is not HODLRSolver):
+                grad[n_wn : n_wn + l] = 0.5 * np.sum(
+                    (np.exp(wn) * np.diag(A))[None, :] * wng, axis=1
+                )
+            else:
+                alpha_term = np.zeros(l)
+                if(l>1):
+                    raise RuntimeError("The following do not support l>1")
+                    
+                t = ((np.exp(wn)) * wng).flatten()
+                alpha_term[0] = np.sum(0.5*alpha * t * alpha)
 
+                ########## YL: Note that the standard and symmetric trace estimators are the same for the whitenoise
+                trace_estimates = np.zeros(l)
+                for k in range(l):
+                    trace_k = 0.0
+                    for _ in range(nvec):
+                        # Generate a random vector u_l with entries in {-1, 1}
+                        u = np.random.choice([1, -1], size=alpha.shape[0])
+                        y = t*u
+                        z = self.solver.apply_inverse(y, in_place=False).flatten()
+                        quadratic_form = 0.5*u.T @ z
+                        trace_k += quadratic_form
+                    # Average over N samples
+                    trace_estimates[k] = trace_k / nvec
+                grad[n_wn : n_wn + l] =alpha_term-trace_estimates
+
+                if(self.solver_kwargs['debug']==1):
+                    Kg_wn=np.diag((np.exp(wn) * wng).flatten())
+                    tmp = 0.5 * np.einsum("ij,ij", Kg_wn, A) 
+                    print(tmp,'grad_white_noise_exact')
+                    print(grad[n_wn : n_wn + l],'grad_white_noise_random')
+
+
+        n_k = n_wn + l
         l = len(self.kernel)
         if l:
-            Kg = self.kernel.get_gradient(self._x)
-            
-            
-            # Kg_save = copy.deepcopy(Kg)
-            # x1_x2=self._x[0][0]-self._x[1][0]
-            # l=np.exp(self.parameter_vector[3])
-            # l2=x1_x2*x1_x2/2/l/l    
-            # print('ddd',Kg[0,1,0],Kg[0,1,1],np.exp(self.parameter_vector[2])*np.exp(-l2),np.exp(self.parameter_vector[2])*np.exp(-l2)*l2)
+            if(self.solver_type is not HODLRSolver):
+                Kg = self.kernel.get_gradient(self._x)
+                grad[n_k : n_k + l] = 0.5 * np.einsum("ijk,ij", Kg, A)
 
-            grad[n : n + l] = 0.5 * np.einsum("ijk,ij", Kg, A)
+            else:
+                alpha_term = np.zeros(l)
+                for k in range(l):
+                    y = self.solver.apply_forward(alpha,k+1)
+                    alpha_term[k]=0.5*np.dot(y.T, alpha[:,None])
+
+                trace_estimates = np.zeros(l)
+
+                if(self.solver_kwargs['debug']==1):
+                    Kg = self.kernel.get_gradient(self._x)
+                    K = self.solver.get_full(0)
+                    L = np.linalg.cholesky(K)
+
+                for k in range(l):
+                    trace_k = 0.0
+                    trace_k_sym = 0.0
+                    for _ in range(nvec):
+
+                        u = np.random.choice([1, -1], size=alpha.shape[0])
+                        
+                        if(self.solver_kwargs['sym']==0):                      
+                            if(self.solver_kwargs['debug']==1):  
+                                y = np.linalg.solve(L, Kg[:, :, k] @ u)
+                                x = np.linalg.solve(L.T, y)
+                                quadratic_form = 0.5*u.T @ x
+                                # print("quadratic_form sketching (no compression): ",quadratic_form)
+                            
+                            y = self.solver.apply_forward(u,k+1)
+                            z = self.solver.apply_inverse(y, in_place=False).flatten()
+                            quadratic_form = 0.5*u.T @ z
+                            # if(self.solver_kwargs['debug']==1):
+                            #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
+                        else:
+                            ######### Note that L and W are different WW^T is not a Cholesky, so the following two quadratic_form shouldn't match     
+                            if(self.solver_kwargs['debug']==1):    
+                                quadratic_form = 0.5*u.T @ np.linalg.solve(L, Kg[:, :, k] @ np.linalg.solve(L.T, u)) 
+                                # print("quadratic_form sketching (no compression): ",quadratic_form)
+                            
+                            y = self.solver.apply_inverse_sym_W_transpose(u, in_place=False)
+                            # y = np.linalg.solve(L.T, u)
+                            z = self.solver.apply_forward(y,k+1)
+                            quadratic_form = 0.5*y.T @ z
+                            # if(self.solver_kwargs['debug']==1):
+                            #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
+                        
+
+                        trace_k += quadratic_form
+
+                    # Average over N samples
+                    trace_estimates[k] = trace_k / nvec
+                grad[n_k : n_k + l] =alpha_term-trace_estimates
+
+                if(self.solver_kwargs['debug']==1):
+                    Kg = self.kernel.get_gradient(self._x)
+                    tmp = 0.5 * np.einsum("ijk,ij", Kg, A)                
+                    print(tmp,'grad_kernel_exact')
+                    print(alpha_term-trace_estimates,'grad_kernel_random')
+
+
+
 
         return grad
 
