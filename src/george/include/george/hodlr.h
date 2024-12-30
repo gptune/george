@@ -82,27 +82,6 @@ public:
           else
             std::cout<<"top-level rank of pK: "<<rank_<<" for hyperparameter "<< grad_-1 <<std::endl;
 
-      if(rank_==half){
-        Eigen::MatrixXd S;
-        S = get_exact_matrix();
-
-        Eigen::JacobiSVD<Eigen::MatrixXd> svd(S, Eigen::ComputeThinU | Eigen::ComputeThinV);
-        Eigen::VectorXd singular_values = svd.singularValues();
-        std::cout << "Singular values of S are:\n" << singular_values << std::endl;
-
-        std::ofstream file("fullmat.csv");
-        for (int i = 0; i < S.rows(); ++i) {
-            for (int j = 0; j < S.cols(); ++j) {
-                file << S(i, j);
-                if (j < S.cols() - 1)
-                    file << ", ";  
-            }
-            file << "\n";
-        }
-        file.close();
-        std::cout << "Full-rank block dumped to fullmat.csv.\n" << std::endl;
-        exit(0);
-      }
 
       // Build the children
       children_[0] = new Node<KernelType>(
@@ -329,8 +308,8 @@ private:
 
     // Allocate all the memory that we'll need.
     int max_rank = std::min(n_rows, n_cols);
-    Eigen::MatrixXd U(n_rows, max_rank),
-                    V(n_cols, max_rank);
+    Eigen::MatrixXd U(n_rows, 100), 
+                    V(n_cols, 100); //the size of U and V can be resized on-the-fly
 
     // Setup
     int rank = 0;
@@ -341,11 +320,12 @@ private:
     double norm = 0.0, tol2 = tol * tol, tol_abs2 = tol_abs * tol_abs;
     double smallval = 1e-14;
     std::vector<int> index(n_rows);
-    std::vector<int> ridxs;
+    std::vector<int> ridxs,ridxs0;
     std::vector<int> cidxs;
     for (int n = 0; n < n_rows; ++n) index[n] = n;
 
     if(fullsvd==1){
+      
       Eigen::MatrixXd full = Eigen::MatrixXd::Zero(n_rows, n_cols);
 
       for (int m = 0; m < n_cols; ++m)
@@ -386,33 +366,114 @@ private:
     }
 
 
+
+
+
+  //  for (int m = 0; m < n_cols; ++m){
+  //   for (int k=0; k<nns.cols();++k){
+  //     if(nns(start_col + m,k)>=start_row && nns(start_col + m,k)<start_row+n_rows){
+  //       ridxs0.push_back(nns(start_col + m,k) - start_row);
+  //     }
+  //   }
+  //  }
+  //  removeRedundantElements(ridxs0);
+  // std::unordered_set<int> setA(ridxs0.begin(), ridxs0.end());
+
+  // // Step 2: Use remove_if to filter out elements in 'b' that are in 'setA'
+  // index.erase(
+  //     std::remove_if(index.begin(), index.end(), [&setA](int x) {
+  //         return setA.count(x) > 0; // Remove if x is in setA
+  //     }),
+  //     index.end()
+  // );
+
+
+
     while (1) {
       int i, j, k;
       do {
         // If we run out of rows to try, just return the trivial factorization
         if (index.empty()) {
-          U_out.resize(n_rows, max_rank);
-          V_out.resize(n_cols, max_rank);
-          if (n_cols <= n_rows) {
-            V_out.setIdentity();
-            for (int m = 0; m < n_cols; ++m)
-              for (int n = 0; n < n_rows; ++n)
-                if(grad_==0)
-                  U_out(n, m) = kernel_->get_value(start_row + n, start_col + m);
-                else
-                  U_out(n, m) = kernel_->get_gradient(start_row + n, start_col + m, grad_-1);
-          } else {
-            U_out.setIdentity();
+
+          std::cout << "Warning: index empty, use SVD instead" << std::endl; 
+
+          Eigen::MatrixXd full = Eigen::MatrixXd::Zero(n_rows, n_cols);
+
+          for (int m = 0; m < n_cols; ++m)
             for (int n = 0; n < n_rows; ++n)
-              for (int m = 0; m < n_cols; ++m)
-                if(grad_==0)
-                  V_out(m, n) = kernel_->get_value(start_row + n, start_col + m);
-                else
-                  V_out(m, n) = kernel_->get_gradient(start_row + n, start_col + m, grad_-1);
+              if(grad_==0)
+                full(n, m) = kernel_->get_value(start_row + n, start_col + m);
+              else
+                full(n, m) = kernel_->get_gradient(start_row + n, start_col + m, grad_-1);
+
+          // Compute the full SVD 
+          Eigen::JacobiSVD<Eigen::MatrixXd> svd(full, Eigen::ComputeFullU | Eigen::ComputeFullV);
+          Eigen::VectorXd singularValues = svd.singularValues();
+          // Determine the truncation threshold
+          double maxSingularValue = singularValues(0);  // Assuming the singular values are sorted in descending order
+          double threshold = std::max(tol * maxSingularValue, tol_abs);
+          // Count significant singular values
+          int ranknew = 0;
+          for (int i = 0; i < singularValues.size(); ++i) {
+              if (singularValues(i) > threshold)
+                  ranknew++;
+              else
+                  break;
           }
-          return max_rank;
+          ranknew = std::max(ranknew,1);
+          rank = ranknew;
+          // Construct the truncated matrices
+          Eigen::MatrixXd U_truncated = svd.matrixU().leftCols(rank);
+          Eigen::MatrixXd V_truncated = svd.matrixV().leftCols(rank);
+          Eigen::VectorXd Sigma_truncated = singularValues.head(rank);
+
+          // Optionally, construct the diagonal matrix for Sigma
+          Eigen::MatrixXd Sigma_diag = Sigma_truncated.asDiagonal();
+          U_out.resize(n_rows, rank);
+          U_out = U_truncated* Sigma_diag;
+          V_out.resize(n_cols, rank);
+          V_out = V_truncated;
+
+
+
+          std::cout << "Truncated singular values are:\n" << Sigma_truncated << std::endl;
+          
+          if(0){
+          std::ofstream file("fullmat.csv");
+          for (int i = 0; i < full.rows(); ++i) {
+              for (int j = 0; j < full.cols(); ++j) {
+                  file << full(i, j);
+                  if (j < full.cols() - 1)
+                      file << ", ";  
+              }
+              file << "\n";
+          }
+          file.close();
+          std::cout << "Full-rank block of nrow "<<full.rows()<<" ncol "<<full.cols() << " dumped to fullmat.csv.\n" << std::endl;
+          exit(0);
+          }
+
+
+          return rank;
+
+
         }
 
+
+        // if(ridxs0.empty()){
+        //   // Choose a random row
+        //   std::uniform_int_distribution<int> uniform_dist(0, index.size()-1);
+        //   k = uniform_dist(random);
+        //   i = index[k];
+        //   ridxs.push_back(i);
+        //   index[k] = index.back();
+        //   index.pop_back();
+        // }else{
+        //   i = ridxs0.back();
+        //   ridxs.push_back(i);
+        //   ridxs0.pop_back();
+        // }
+        
         // Choose a random row
         std::uniform_int_distribution<int> uniform_dist(0, index.size()-1);
         k = uniform_dist(random);
@@ -420,6 +481,8 @@ private:
         ridxs.push_back(i);
         index[k] = index.back();
         index.pop_back();
+
+
 
         // Compute the residual and choose the pivot
         for (int n = 0; n < n_cols; ++n)
@@ -432,7 +495,7 @@ private:
         cidxs.push_back(j);
 
       // } while (std::abs(V(j, rank)) < smallval);
-      } while (std::abs(V(j, rank)) < smallval && ++ntry<10);
+      } while (std::abs(V(j, rank)) < smallval && ++ntry<std::max(10,std::min(1000,n_rows/10)));
       if(std::abs(V(j, rank)) < smallval) break;
 
       // Normalize
@@ -450,6 +513,14 @@ private:
       // Update the rank
       rank++;
       if (rank >= max_rank) break;
+
+      // resize U and V if needed
+      int cur_size = U.cols();
+      if (rank>cur_size){ 
+        U.conservativeResize(n_rows, std::min(max_rank,cur_size*2));
+        V.conservativeResize(n_cols, std::min(max_rank,cur_size*2));
+      }
+
 
       // Only update if this is a substantial change
       double rowcol_norm = U.col(rank-1).squaredNorm() * V.col(rank-1).squaredNorm();
@@ -531,8 +602,10 @@ private:
       // Eigen::MatrixXd A1 = U1*V1;
       // Eigen::MatrixXd A = U.block(0, 0, n_rows, rank)*V.block(0, 0, n_cols, rank);
       // std::cout<<" hh "<<A1.norm()<<" "<<A.norm()<<" "<<(A-A1).norm()<<std::endl;
-      U.block(0, 0, n_rows, rank)=U1;
-      V.block(0, 0, n_rows, rank)=V1;
+      U.resize(n_rows,rank);
+      U=U1;
+      V.resize(n_cols,rank);
+      V=V1;
     }
 
 
