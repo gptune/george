@@ -17,6 +17,7 @@ __all__ = [
     "Matern32Kernel",
     "PolynomialKernel",
     "DotProductKernel",
+    "LCMKernel",
 ]
 
 import numpy as np
@@ -802,6 +803,7 @@ class ExpSquaredKernel (Kernel):
         self.min_block, self.max_block = map(np.array, zip(*block))
     
 
+
 class BaseMatern32Kernel (Model):
     parameter_names = ()
 
@@ -964,3 +966,212 @@ class DotProductKernel (Kernel):
         # Common setup.
         self.dirty = True
     
+
+
+
+
+
+
+class BaseLCMKernel(Model):
+    """
+    A base model that stores 'logBK' as a 1D array
+    of length T*Q*2, but internally doesn't define
+    a single named parameter. Instead, we define
+    a custom parameter_vector for flattening/unflattening.
+    """
+    parameter_names = ()  # Empty tuple => no single-scalar names
+
+    def __init__(self, T, Q, logBK=None):
+        
+        self.T = T
+        self.Q = Q
+
+        # Expect logBK to be 1D array of length T*Q*2
+        self.logBK = np.array(logBK, copy=True)
+        super(BaseLCMKernel, self).__init__()
+
+        # For safety, check dimension:
+        expected_len = self.T * self.Q * 2
+        if len(self.logBK) != expected_len:
+            raise ValueError(f"logBK must have length {expected_len}.")
+
+    @property
+    def parameter_vector(self):
+        """
+        Flatten logBK into a single 1D vector so 'george' can do optimization.
+        Actually, logBK is already a 1D array, so we can just return it.
+        """
+        return self.logBK
+
+    @parameter_vector.setter
+    def parameter_vector(self, v):
+        """
+        The inverse: copy from v into self.logBK.
+        """
+        if(len(v)>0):
+            expected = self.T * self.Q * 2            
+            if len(v) != expected:
+                raise ValueError("dimension mismatch in BaseLCMKernel parameter_vector")
+            self.logBK = np.array(v, copy=True)
+            self.dirty = True
+
+    @property
+    def full_size(self):
+        """
+        The total number of free parameters (T*Q*2).
+        """
+        return self.logBK.size
+
+
+
+class LCMKernel(Kernel):
+    kernel_type = 13  # The integer ID for your C++ parser
+    stationary = True
+    block = None
+    metric = None
+
+    def __init__(self, logBK, children, T, Q, ndim=1, axes=None):
+        """
+        logBK: a 1D array of length T*Q*2
+        children: a list of child kernels
+        T, Q: integers
+        ndim, axes: standard George kernel arguments
+        """
+        self.T = T
+        self.Q = Q
+        self.children = children
+
+        self.ndim = ndim
+        if axes is None:
+            axes = np.arange(ndim, dtype=int)
+        self.axes = axes
+
+        # Build the "base" model that stores logBK
+        base = BaseLCMKernel(T, Q, logBK=logBK)
+
+        # We pass it to the parent constructor as a sub-model
+        super(LCMKernel, self).__init__([
+            (None, base),
+        ] + [(f"child_{i}", c) for i, c in enumerate(children)]
+        )
+        self.dirty = True
+
+    # Now you can define other kernel methods as needed. e.g.:
+
+    def __repr__(self):
+        # A minimal textual representation
+        return ("LCMKernel(T={0}, Q={1}, "
+                "ndim={2}, axes={3}, "
+                "children={4})".format(self.T, self.Q,
+                                       self.ndim, self.axes,
+                                       [repr(c) for c in self.children]))
+
+
+
+
+
+
+
+
+
+# class BaseLCMKernel(Model):
+#     parameter_names = ("logBK", )
+
+# class LCMKernel(Kernel):
+#     kernel_type = 13  # Must match the "case 13" above
+#     stationary = True
+#     block = None
+#     metric = None
+
+#     def __init__(self, logBK, children, T, Q, ndim=1, axes=None):
+#         self.logBK = logBK  # length T*Q*2
+#         self.T = T 
+#         self.Q = Q
+#         self.children = children
+
+#         self.ndim = ndim
+#         if axes is None:
+#             axes = np.arange(ndim, dtype=int)
+#         self.axes = axes
+
+#         kwargs = dict(logBK=logBK, )
+#         base = BaseLCMKernel(**kwargs)
+#         super(LCMKernel, self).__init__([
+#             (None, base),
+#         ] + [(f"child_{i}", c) for i, c in enumerate(children)]
+#         )
+#         self.dirty = True
+
+#     @property
+#     def full_size(self):
+#         """The total number of parameters (including frozen parameters)"""
+#         return len(self.T*self.Q*2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# class BaseLCMKernel(Model):
+#     # If you keep parameter_names empty, it won't attempt the default loop
+#     parameter_names = ("logB", "logK")
+
+#     def __init__(self, T, Q, logB=None, logK=None):
+#         self.T = T
+#         self.Q = Q
+#         # Expect logB, logK as 1D arrays of length T*Q
+#         self.logB = np.array(logB, copy=True)
+#         self.logK = np.array(logK, copy=True)
+#         super(BaseLCMKernel, self).__init__()        
+
+    # @property
+    # def parameter_vector(self):
+    #     """
+    #     Flatten logB and logK into a single 1D vector
+    #     so that 'george' can do optimization on it.
+    #     """
+    #     return np.concatenate([self.logB, self.logK])
+
+    # @parameter_vector.setter
+    # def parameter_vector(self, v):
+    #     """
+    #     The inverse: reshape the 1D vector back into logB and logK.
+    #     """
+    #     # The total number of elements we expect
+    #     print('in parameter_vector: ',v,len(v),2*self.T * self.Q)
+    #     TQ = self.T * self.Q  
+    #     if len(v) != 2 * TQ:
+    #         raise ValueError("dimension mismatch in BaseLCMKernel parameter_vector")
+
+    #     # The first T*Q => logB, the next T*Q => logK
+    #     self.logB = v[:TQ]
+    #     self.logK = v[TQ:]
+    #     self.dirty = True
+
+# class LCMKernel(Kernel):
+#     kernel_type = 13
+
+#     def __init__(self, logB, logK, children, T, Q, ndim=1, axes=None):
+#         self.T = T
+#         self.Q = Q
+#         self.children = children
+#         self.ndim = ndim
+#         ...
+
+#         # Construct the "base" with arrays
+#         base = BaseLCMKernel(T, Q, logB=logB, logK=logK)
+#         # Pass that base to super(...) so george knows about it
+#         super(LCMKernel, self).__init__([
+#             (None, base),
+#         ] + [(f"child_{i}", c) for i, c in enumerate(children)]
+#         )
+#         self.dirty = True

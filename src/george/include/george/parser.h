@@ -500,6 +500,48 @@ kernels::Kernel* parse_kernel_spec (const py::object& kernel_spec) {
       }
 
       break; }
+
+
+      case 13: {
+        // Our new local coreg kernel
+        py::array_t<double> logBK = py::array_t<double>(kernel_spec.attr("logBK"));
+
+        auto BK_buf = logBK.unchecked<1>();
+        size_t T = py::int_(kernel_spec.attr("T"));
+        size_t Q = py::int_(kernel_spec.attr("Q"));
+        // verify K_buf.shape(0)==T, shape(1)==Q, etc.
+
+        std::vector<double> init_logB(T*Q), init_logK(T*Q);
+        for (size_t t=0; t<T; ++t) {
+          for (size_t q=0; q<Q; ++q) {
+            init_logB[t*Q + q] = BK_buf(t*Q + q);
+            init_logK[t*Q + q] = BK_buf(Q*T+t*Q + q);
+          }
+        }
+
+        // Parse children
+        py::list py_children = py::list(kernel_spec.attr("children"));
+        std::vector<kernels::Kernel*> child_ptrs;
+        child_ptrs.reserve(py::len(py_children));
+        for (size_t i=0; i<py::len(py_children); ++i) {
+          py::object child_spec = py_children[i];
+          kernels::Kernel* ck = parse_kernel_spec(child_spec);
+          child_ptrs.push_back(ck);
+        }
+
+        // parse dimension or axes if needed
+        size_t ndim = py::int_(kernel_spec.attr("ndim"));
+        // or py::list axes = kernel_spec.attr("axes") etc.
+
+        // Construct
+        kernel = new kernels::LCMKernel(
+            init_logB, init_logK, T, child_ptrs, ndim+1 
+        );
+
+        break;
+      }
+
+
     
     default:
       throw std::invalid_argument("unrecognized kernel");

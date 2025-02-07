@@ -2219,6 +2219,310 @@ private:
 };
 
 
+
+/**
+ * A local coregionalization kernel (LCMKernel) storing B_{t,q} and K_{t,q} in *linear space*,
+ * but from the perspective of external code, they are log-parameters.
+ *
+ * The child kernels (like ExpSquaredKernel) see only x1[0..(naxes-2)],
+ * x2[0..(naxes-2)] as the "spatial" dimensions. The last coordinate is the task ID.
+ *
+ * Formula:
+ *   K(x1, x2) = sum_{q=0..Q-1}
+ *     [ B_{t1,q} * B_{t2,q} + K_{t1,q}*delta_{(t1==t2)} ]
+ *     * child_q.value(x1_spatial, x2_spatial)
+ */
+class LCMKernel : public Kernel
+{
+public:
+    /**
+     * @param init_logB   (size T*Q) => B_{t,q} = exp(init_logB[i]) stored in linear space
+     * @param init_logK   (size T*Q) => K_{t,q} = exp(init_logK[i]) stored in linear space
+     * @param num_tasks   T
+     * @param children    Q child kernels, each operating on (naxes-1) dims
+     * @param naxes       total dims, including last for the task ID
+     */
+    LCMKernel(
+        const std::vector<double>& init_logB,
+        const std::vector<double>& init_logK,
+        size_t num_tasks,
+        std::vector<Kernel*> children,
+        size_t naxes
+    )
+    : num_tasks_(num_tasks),
+      children_(std::move(children)),
+      naxes_(naxes)
+    {
+        num_latent_ = children_.size(); // Q
+        const size_t TQ = num_tasks_ * num_latent_;
+        if (init_logB.size() != TQ) {
+            throw std::invalid_argument("init_logB must have length T*Q.");
+        }
+        if (init_logK.size() != TQ) {
+            throw std::invalid_argument("init_logK must have length T*Q.");
+        }
+
+        // Allocate & exponentiate B_, K_ in linear space
+        B_.resize(TQ);
+        K_.resize(TQ);
+        for (size_t i = 0; i < TQ; ++i) {
+            B_[i] = std::exp(init_logB[i]);  // store in linear
+            K_[i] = std::exp(init_logK[i]);
+        }
+
+        // total param size = (TQ + TQ) + sum of children sizes
+        size_ = 2*TQ;
+        for (auto* c : children_) {
+            size_ += c->size();
+        }
+    }
+
+    ~LCMKernel() {
+        // If we truly own them, delete. Otherwise, manage accordingly.
+        for (auto* c : children_) {
+            delete c;
+        }
+    }
+
+
+
+    size_t get_ndim () const { return naxes_; };
+
+
+    double value(const double* x1, const double* x2) override {
+        // The last coordinate is the task
+        size_t t1 = static_cast<size_t>(x1[naxes_ - 1]);
+        size_t t2 = static_cast<size_t>(x2[naxes_ - 1]);
+        if (t1 >= num_tasks_ || t2 >= num_tasks_) {
+            return 0.0;
+        }
+
+        // Copy the first (naxes_-1) coords for the child kernels
+        std::vector<double> x1_spatial(naxes_ - 1), x2_spatial(naxes_ - 1);
+        for (size_t i = 0; i < naxes_ - 1; ++i) {
+            x1_spatial[i] = x1[i];
+            x2_spatial[i] = x2[i];
+        }
+
+
+
+        double sumval = 0.0;
+        for (size_t q = 0; q < num_latent_; ++q) {
+            double bprod = B_[t1 * num_latent_ + q] * B_[t2 * num_latent_ + q];
+            double kterm = 0.0;
+            if (t1 == t2) {
+                kterm = K_[t1 * num_latent_ + q];
+            }
+
+            // Evaluate child kernel on the spatial coords
+            double cval = children_[q]->value(x1_spatial.data(), x2_spatial.data());
+            // if(fabs(x1[0]-0.887218)<1e-5 &&  fabs(x2[0]-0.739814)<1e-5){  
+            // std::cout<<" child " <<cval<<std::endl;
+            // std::cout<<" B  " <<B_[t1 * num_latent_ + q]<< " "<<B_[t2 * num_latent_ + q] <<std::endl;
+            // std::cout<<" K  " <<K_[t1 * num_latent_ + q]<< " "<<K_[t2 * num_latent_ + q] <<std::endl;
+            // }
+
+            sumval += (bprod + kterm) * cval;
+        }
+        
+
+// if(fabs(x1[0]-0.887218)<1e-5 &&  fabs(x2[0]-0.739814)<1e-5){          
+//         // for (size_t i = 0; i < naxes_ ; ++i) {
+//         //     std::cout<<" x1 " <<x1[i]<<std::endl;
+//         // }
+
+//         // for (size_t i = 0; i < naxes_ ; ++i) {
+//         //     std::cout<<" x2 " <<x2[i]<<std::endl;
+//         // }
+
+//         // for (size_t t = 0; t < num_tasks_; ++t) {
+//         //     for (size_t q = 0; q < num_latent_; ++q) {
+//         //         std::cout<<" B " <<B_[t * num_latent_ + q]<<std::endl;
+//         //     }
+//         // }
+//         // for (size_t t = 0; t < num_tasks_; ++t) {
+//         //     for (size_t q = 0; q < num_latent_; ++q) {
+//         //         std::cout<<" K " <<K_[t * num_latent_ + q]<<std::endl;
+//         //     }
+//         // }
+//         std::cout<<x1[0]<<" "<<x1[1]<<" "<<x2[0]<<" "<<x2[1]<<" V " <<sumval<<std::endl;
+// }
+//         // exit(1);        
+        
+        return sumval;
+        
+    }
+
+    void gradient(const double* x1, const double* x2,
+                  const unsigned* which, double* grad) override
+    {
+        // zero out
+        std::fill(grad, grad + size_, 0.0);
+
+        size_t t1 = static_cast<size_t>(x1[naxes_ - 1]);
+        size_t t2 = static_cast<size_t>(x2[naxes_ - 1]);
+        if (t1 >= num_tasks_ || t2 >= num_tasks_) {
+            // out-of-range => gradient = 0
+            return;
+        }
+
+        // Copy spatial part
+        std::vector<double> x1_spatial(naxes_ - 1), x2_spatial(naxes_ - 1);
+        for (size_t i = 0; i < naxes_ - 1; ++i) {
+            x1_spatial[i] = x1[i];
+            x2_spatial[i] = x2[i];
+        }
+
+        // Precompute child kernel values & child kernel gradients
+        std::vector<double> child_vals(num_latent_);
+        std::vector< std::vector<double> > child_grads(num_latent_);
+
+        for (size_t q = 0; q < num_latent_; ++q) {
+            child_vals[q] = children_[q]->value(x1_spatial.data(), x2_spatial.data());
+
+            child_grads[q].resize(children_[q]->size(), 0.0);
+            children_[q]->gradient(x1_spatial.data(), x2_spatial.data(),
+                                   which, child_grads[q].data());
+        }
+
+        const size_t TQ = num_tasks_ * num_latent_;
+        size_t offset = 0;
+
+        // 1) partial wrt logB_{t,q} => B_{t,q} * partial wrt B_{t,q}
+        for (size_t i = 0; i < TQ; ++i) {
+            if (!which || which[offset + i]) {
+                size_t t = i / num_latent_;
+                size_t q = i % num_latent_;
+
+                double dFdBtq = 0.0;
+                double Bt1q = B_[t1 * num_latent_ + q];
+                double Bt2q = B_[t2 * num_latent_ + q];
+
+                if (t1 == t2) {
+                    if (t == t1) {
+                        // derivative wrt B_{t1,q} => 2*B_{t1,q} * child_vals[q]
+                        dFdBtq = 2.0 * Bt1q * child_vals[q];
+                    }
+                } else {
+                    if (t == t1) {
+                        dFdBtq = Bt2q * child_vals[q];
+                    } else if (t == t2) {
+                        dFdBtq = Bt1q * child_vals[q];
+                    }
+                }
+                // chain rule wrt log(B_{t,q}) => multiply by B_{t,q}
+                double B_tq = B_[t * num_latent_ + q];
+                grad[offset + i] = B_tq * dFdBtq;
+            }
+        }
+        offset += TQ;
+
+        // 2) partial wrt logK_{t,q}
+        for (size_t i = 0; i < TQ; ++i) {
+            if (!which || which[offset + i]) {
+                size_t t = i / num_latent_;
+                size_t q = i % num_latent_;
+
+                // derivative is nonzero only if t1 == t2 && t==t1 => child_vals[q]
+                if (t1 == t2 && t == t1) {
+                    double K_tq = K_[t * num_latent_ + q];
+                    grad[offset + i] = K_tq * child_vals[q];
+                }
+            }
+        }
+        offset += TQ;
+
+        // 3) partial wrt child kernel parameters
+        //    factor = B_{t1,q}*B_{t2,q} + K_{t1,q}*(delta_{(t1==t2)})
+        for (size_t q = 0; q < num_latent_; ++q) {
+            double Bt1q = B_[t1 * num_latent_ + q];
+            double Bt2q = B_[t2 * num_latent_ + q];
+            double factor = Bt1q * Bt2q;
+            if (t1 == t2) {
+                factor += K_[t1 * num_latent_ + q];
+            }
+
+            size_t csize = children_[q]->size();
+            for (size_t p = 0; p < csize; ++p) {
+                if (!which || which[offset + p]) {
+                    grad[offset + p] = factor * child_grads[q][p];
+                }
+            }
+            offset += csize;
+        }
+    }
+
+    // total # of parameters
+    size_t size() const override {
+        return size_;
+    }
+
+    // Externally, B_ and K_ are log-parameters
+    double get_parameter(size_t i) const override {
+        const size_t TQ = num_tasks_ * num_latent_;
+        if (i < TQ) {
+            // logB
+            return std::log(B_[i]);
+        }
+        i -= TQ;
+        if (i < TQ) {
+            // logK
+            return std::log(K_[i]);
+        }
+        i -= TQ;
+        // child
+        for (auto* c : children_) {
+            size_t cs = c->size();
+            if (i < cs) {
+                return c->get_parameter(i);
+            }
+            i -= cs;
+        }
+        throw std::out_of_range("LCMKernel::get_parameter: index out of range");
+    }
+
+    void set_parameter(size_t i, double value) override {
+        const size_t TQ = num_tasks_ * num_latent_;
+        if (i < TQ) {
+            // logB
+            B_[i] = std::exp(value);
+            return;
+        }
+        i -= TQ;
+        if (i < TQ) {
+            // logK
+            K_[i] = std::exp(value);
+            return;
+        }
+        i -= TQ;
+        // child
+        for (auto* c : children_) {
+            size_t cs = c->size();
+            if (i < cs) {
+                c->set_parameter(i, value);
+                return;
+            }
+            i -= cs;
+        }
+        throw std::out_of_range("LCMKernel::set_parameter: index out of range");
+    }
+
+private:
+    // Internally we store B_, K_ in linear space (size T*Q).
+    std::vector<double> B_;
+    std::vector<double> K_;
+
+    size_t num_tasks_;       // T
+    size_t num_latent_;      // Q
+    std::vector<Kernel*> children_;
+    size_t naxes_;           // total dims (including last for task)
+
+    size_t size_;            // total param count
+};
+
+
+
+
 /*
 A polynomial kernel
 

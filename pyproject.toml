@@ -20,5 +20,18 @@ wheel.install-dir = "george"
 minimum-version = "0.5"
 build-dir = "build/{wheel_tag}"
 
+
+
+# [tool.scikit-build.cmake]
+# build-type = "debug"
+# args = [
+#   "-DCMAKE_VERBOSE_MAKEFILE=ON",
+#   "-DCMAKE_CXX_FLAGS_DEBUG=-O0 -g",
+#   "-DCMAKE_CXX_FLAGS_RELEASE=",
+#   "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=",
+# ]
+
+
+
 [tool.setuptools_scm]
 write_to = "src/george/george_version.py"

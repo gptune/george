@@ -8,6 +8,8 @@
 #include <Eigen/Dense>
 #include <fstream>
 #include <Eigen/SVD>
+#include <chrono>
+
 
 using RowMatrixXi = Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
@@ -84,10 +86,14 @@ public:
 
 
       // Build the children
+      #pragma omp task
       children_[0] = new Node<KernelType>(
           diag_, kernel_, start_, half, min_size, tol, tol_abs, verbose, debug, sym, random, 0, grad_, this);
+      
+      #pragma omp task
       children_[1] = new Node<KernelType>(
           diag_, kernel_, start_+half, size_-half, min_size, tol, tol_abs, verbose, debug, sym, random, 1, grad_, this);
+      #pragma omp taskwait
 
     } else {
       is_leaf_ = true;
@@ -387,7 +393,7 @@ private:
   //     index.end()
   // );
 
-
+auto start = std::chrono::high_resolution_clock::now();
 
     while (1) {
       int i, j, k;
@@ -485,6 +491,7 @@ private:
 
 
         // Compute the residual and choose the pivot
+        // #pragma omp parallel for
         for (int n = 0; n < n_cols; ++n)
           if(grad_==0)
             V(n, rank) = kernel_->get_value(start_row + i, start_col + n);
@@ -502,6 +509,7 @@ private:
       V.col(rank) /= V(j, rank);
 
       // Compute the U factorization
+      // #pragma omp parallel for
       for (int n = 0; n < n_rows; ++n)
         if(grad_==0)
           U(n, rank) = kernel_->get_value(start_row + n, start_col + j);
@@ -516,7 +524,7 @@ private:
 
       // resize U and V if needed
       int cur_size = U.cols();
-      if (rank>cur_size){ 
+      if (rank>=cur_size){ 
         U.conservativeResize(n_rows, std::min(max_rank,cur_size*2));
         V.conservativeResize(n_cols, std::min(max_rank,cur_size*2));
       }
@@ -608,6 +616,10 @@ private:
       V=V1;
     }
 
+    auto end1 = std::chrono::high_resolution_clock::now();
+    auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(end1 - start);
+    // std::cout << "Time taken before qrsvd: " << duration1.count() << " milliseconds" << std::endl;
+    // exit(0);
 
     if(qrsvd==1){
       // QR-SVD
@@ -652,6 +664,17 @@ private:
       U_out = U.block(0, 0, n_rows, rank);
       V_out = V.block(0, 0, n_cols, rank);
     }
+
+    if (!std::isfinite(U_out.norm()) || !std::isfinite(V_out.norm())){
+      U_out.setZero();
+      V_out.setZero();
+    }
+    // std::cout << "norm in ACA: " << U_out.norm() << " " << V_out.norm() << std::endl;
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    // std::cout << "Time taken in ACA: " << duration.count() << " milliseconds" << std::endl;
 
     return rank;
   };

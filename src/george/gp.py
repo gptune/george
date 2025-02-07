@@ -243,7 +243,7 @@ class GP(ModelSet):
 
         # Double check the dimensions against the kernel.
         if len(t.shape) != 2 or (
-            self.kernel is not None and t.shape[1] != self.kernel.ndim
+            self.kernel is not None and (t.shape[1] != self.kernel.ndim and self.kernel.kernel_type !=13)
         ):
             raise ValueError("Dimension mismatch")
 
@@ -330,7 +330,10 @@ class GP(ModelSet):
 
         # Include the white noise term.
         yerr = np.sqrt(self._yerr2 + np.exp(self._call_white_noise(self._x)))
-        self.solver.compute(self._x, self._nns, yerr, **kwargs)
+        if isinstance(self.solver, HODLRSolver):
+            self.solver.compute(self._x, self._nns, yerr, **kwargs)
+        else:
+            self.solver.compute(self._x, yerr, **kwargs)
 
         self._const = -0.5 * (
             len(self._x) * np.log(2 * np.pi) + self.solver.log_determinant

@@ -6,6 +6,7 @@
 #include "george/kernels.h"
 #include "george/parser.h"
 #include "george/exceptions.h"
+#include <chrono>
 
 namespace py = pybind11;
 
@@ -20,6 +21,7 @@ class SolverMatrix {
       : kernel_(kernel) {};
     void set_input_coordinates (RowMatrixXd x) {
       if (size_t(x.cols()) != kernel_->get_ndim()) {
+        std::cout<<size_t(x.cols())<<" dfdf "<<kernel_->get_ndim()<<std::endl;
         throw george::dimension_mismatch();
       }
       t_ = x;
@@ -125,12 +127,18 @@ public:
       matrix_->nns_=nns;
     }
 
-
+auto start = std::chrono::high_resolution_clock::now();
     // Set up the solver object.
     if (solver_ != NULL) delete solver_;
-    solver_ = new george::hodlr::Node<SolverMatrix> (
+    #pragma omp parallel
+    {
+        #pragma omp single // Only one thread starts the recursive traversal
+            solver_ = new george::hodlr::Node<SolverMatrix> (
         diag, matrix_, 0, n, min_size, tol, tol_abs, verbose, debug, sym, random,0,0);
-
+    }    
+auto end = std::chrono::high_resolution_clock::now();
+auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+std::cout << "Time taken for HODLR: " << duration.count() << " milliseconds" << std::endl;
 
     Eigen::MatrixXd X0;
     Eigen::MatrixXd Y0;  
@@ -168,9 +176,18 @@ public:
       delete gradients_;       
       }
       gradients_ = new george::hodlr::Node<SolverMatrix>*[kernel_->size()];
-      for (int i = 0; i < kernel_->size(); ++i) {
-        gradients_[i] = new george::hodlr::Node<SolverMatrix> (diag, matrix_, 0, n, min_size, tol, tol_abs, verbose, debug, sym, random,0,i+1);
+
+      start = std::chrono::high_resolution_clock::now();
+      #pragma omp parallel
+      {
+          #pragma omp single // Only one thread starts the recursive traversal
+          for (int i = 0; i < kernel_->size(); ++i) {
+          gradients_[i] = new george::hodlr::Node<SolverMatrix> (diag, matrix_, 0, n, min_size, tol, tol_abs, verbose, debug, sym, random,0,i+1);
+        }            
       }
+      end = std::chrono::high_resolution_clock::now();
+      duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+      std::cout << "Time taken for HODLR (derivative): " << duration.count() << " milliseconds" << std::endl;
     }
 
 

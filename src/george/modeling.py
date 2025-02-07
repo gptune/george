@@ -58,7 +58,13 @@ class Model(object):
         except AttributeError:
             # 'bounds' isn't a dictionary - it had better be a list
             self.parameter_bounds = list(bounds)
+        
+        if(self.full_size>0 and len(self.parameter_bounds)==0):
+            for i in range(self.full_size):
+                self.parameter_bounds.append((None, None))
+                        
         if len(self.parameter_bounds) != self.full_size:
+            
             raise ValueError("the number of bounds must equal the number of "
                              "parameters")
         if any(len(b) != 2 for b in self.parameter_bounds):
@@ -163,14 +169,14 @@ class Model(object):
     @property
     def parameter_vector(self):
         """An array of all parameters (including frozen parameters)"""
-        return np.array([getattr(self, k) for k in self.parameter_names])
+        return np.array([getattr(self, k) for k in self.parameter_names]).flatten()
 
     @parameter_vector.setter
     def parameter_vector(self, v):
-        if len(v) != self.full_size:
+        if len(v) != len(self.parameter_names):
             raise ValueError("dimension mismatch")
         for k, val in zip(self.parameter_names, v):
-            setattr(self, k, float(val))
+            setattr(self, k, val)
         self.dirty = True
 
     def get_parameter_dict(self, include_frozen=False):
