@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-
 from __future__ import division, print_function
 
 __all__ = ["BasicSolver"]
 
 import numpy as np
 from scipy.linalg import cholesky, cho_solve
+from scipy.sparse import csc_matrix, issparse
+from scipy.sparse.linalg import splu
+from pdbridge import *
+import copy
+import scipy
 
 
 class BasicSolver(object):
@@ -17,10 +21,17 @@ class BasicSolver(object):
 
     """
 
-    def __init__(self, kernel):
+    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0):
         self.kernel = kernel
         self._computed = False
         self._log_det = None
+        self.verbose = verbose
+        self.INT64 = INT64
+        self.algo3d = algo3d
+        self.compute_grad = compute_grad
+        self.model_sparse = model_sparse
+        self.Kg = None
+        self.K = None
 
     @property
     def computed(self):
@@ -58,19 +69,80 @@ class BasicSolver(object):
             yerr (ndarray[nsamples] or float): The Gaussian uncertainties on
                 the data points at coordinates ``x``. These values will be
                 added in quadrature to the diagonal of the covariance matrix.
-
         """
         # Compute the kernel matrix.
         K = self.kernel.get_value(x)
-        K[np.diag_indices_from(K)] += yerr ** 2
+        self._n = K.shape[0]     
 
-        # Factor the matrix and compute the log-determinant.
-        self._factor = (cholesky(K, overwrite_a=True, lower=False), False)
-        self.log_determinant = 2 * np.sum(np.log(np.diag(self._factor[0])))
+        if self.model_sparse == 1:       
+            K = csc_matrix(K) 
+
+        if self.model_sparse == 1 :
+            diag_yerr = csc_matrix(np.diag(yerr ** 2))
+            K = K + diag_yerr
+            if(self.compute_grad==1):
+                Kg = self.kernel.get_gradient(x)          
+                self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
+
+            # K_copy = copy.deepcopy(K)
+            # K_dense = K_copy.toarray()
+            # self._factor = (cholesky(K_dense, overwrite_a=True, lower=False), False)
+            # print("logdet_dense: ",self._calculate_log_determinant(K_dense))
+        else:
+            eye = np.eye(K.shape[0])
+            K += eye * (yerr ** 2)  # Adjust K with yerr
+        
+        self.K=K
+        
+        # Factor the matrix using sparse Cholesky factorization if K is sparse
+        if self.model_sparse == 1:
+            # self._factor = splu(K)
+            superlu_factor(K, self.INT64, self.algo3d, self.verbose)
+        else:
+            self._factor = (cholesky(K, overwrite_a=True, lower=False), False)
+
+        self.log_determinant = self._calculate_log_determinant(K)
+        # print("self.log_determinant: ",self.log_determinant)
         self.computed = True
 
+
+
+    def _calculate_log_determinant(self, K):
+        """
+        Calculate the log-determinant of the covariance matrix.
+        Uses the determinant of the Cholesky factor.
+
+        Args:
+            K (ndarray or csr_matrix): The covariance matrix.
+
+        Returns:
+            float: The log-determinant value.
+        """
+        if self.model_sparse == 1:
+            # For sparse K, splu doesn't provide logdet. Use slogdet instead. 
+            # sign, logdet = np.linalg.slogdet(K.toarray())
+            sign,logdet = superlu_logdet(self.verbose)
+            log_det = sign*logdet
+        else:
+            # For dense K
+            log_det = 2 * np.sum(np.log(np.diag(self._factor[0])))
+        
+        return log_det
+
+    def apply_forward(self,x,i):
+        if self.model_sparse == 1:
+            if(i==0):
+                return self.K@x
+            else:
+                return self.Kg[i-1]@x    
+        else:
+            if(i==0):
+                return self.K@x    
+            else:
+                raise Exception('self.Kg has not been computed when self.model_sparse is 0 in apply_forward')        
+
     def apply_inverse(self, y, in_place=False):
-        r"""
+        """
         Apply the inverse of the covariance matrix to the input by solving
 
         .. math::
@@ -78,16 +150,28 @@ class BasicSolver(object):
             K\,x = y
 
         Args:
-            y (ndarray[nsamples] or ndadrray[nsamples, nrhs]): The vector or
+            y (ndarray[nsamples] or ndarray[nsamples, nrhs]): The vector or
                 matrix :math:`y`.
             in_place (Optional[bool]): Should the data in ``y`` be overwritten
                 with the result :math:`x`? (default: ``False``)
 
+        Returns:
+            ndarray or sparse matrix: The result of the operation.
         """
-        return cho_solve(self._factor, y, overwrite_b=in_place)
+        if self.model_sparse == 1:
+            # If K was sparse, we need a different approach to apply the inverse
+            if in_place:
+                superlu_solve(y, self.verbose)
+                return y
+            else:
+                x=copy.deepcopy(y)
+                superlu_solve(x, self.verbose)
+                return x
+        else:
+            return cho_solve(self._factor, y, overwrite_b=in_place)
 
     def dot_solve(self, y):
-        r"""
+        """
         Compute the inner product of a vector with the inverse of the
         covariance matrix applied to itself:
 
@@ -98,8 +182,10 @@ class BasicSolver(object):
         Args:
             y (ndarray[nsamples]): The vector :math:`y`.
 
+        Returns:
+            float: Result of the inner product.
         """
-        return np.dot(y.T, cho_solve(self._factor, y))
+        return np.dot(y.T, self.apply_inverse(y))
 
     def apply_sqrt(self, r):
         """
@@ -107,15 +193,20 @@ class BasicSolver(object):
         vector or matrix.
 
         Args:
-            r (ndarray[nsamples] or ndarray[nsamples, nrhs]: The input vector
+            r (ndarray[nsamples] or ndarray[nsamples, nrhs]): The input vector
                 or matrix.
 
+        Returns:
+            ndarray or sparse matrix: Result of the multiplication with the Cholesky factor.
         """
-        return np.dot(r, self._factor[0])
+        if self.model_sparse == 1:
+            raise NotImplementedError("apply_sqrt is not implemented for sparse matrix yet")
+        else:
+            return np.dot(r, self._factor[0])  # Dense multiplication
 
     def get_inverse(self):
         """
         Get the dense inverse covariance matrix. This is used for computing
         gradients, but it is not recommended in general.
         """
-        return self.apply_inverse(np.eye(len(self._factor[0])), in_place=True)
+        return self.apply_inverse(np.eye(self._n), in_place=True)

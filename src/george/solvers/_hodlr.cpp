@@ -93,7 +93,7 @@ public:
       const py::array_t<double>& x,
       const py::array_t<int>& nns,
       const py::array_t<double>& yerr,
-      int min_size = 100, double tol = 0.1, double tol_abs = 1e-10, int verbose = 0, int debug = 0, int compress_grad = 0, int sym = 0, int knn=0, int seed = 0
+      int min_size = 100, double tol = 0.1, double tol_abs = 1e-10, int verbose = 0, int debug = 0, int compute_grad = 0, int sym = 0, int knn=0, int seed = 0
   ) {
     computed_ = 0;
     kernel_ = george::parse_kernel_spec(kernel_spec);
@@ -168,7 +168,7 @@ std::cout << "Time taken for HODLR: " << duration.count() << " milliseconds" << 
 
 
     // Set up the gradients object.
-    if(compress_grad==1){
+    if(compute_grad==1){
       if (gradients_ != NULL){ 
       for (int i = 0; i < kernel_->size(); ++i) {
           delete gradients_[i];  
@@ -289,7 +289,7 @@ Args:
         cost. (default: ``1e-10``)       
     verbose (Optional[int]): The verbosity level. 
     debug (Optional[int]): Debugging information.
-    compress_grad (Optional[int]): Whether to compress the gradient of Covariance matrix.
+    compute_grad (Optional[int]): Whether to compress the gradient of Covariance matrix.
     sym (Optional[int]): Whether to use symmetric HODLR factorization.
     knn (Optional[int]): Number of nearest neighbour points per row/column
     seed (Optional[int]): The low-rank approximation method within the HODLR
@@ -298,7 +298,7 @@ Args:
         that the user provide a seed for the random number generator.
         (default: ``42``, obviously)
 )delim",
-    py::arg("kernel_spec"), py::arg("x"), py::arg("nns"), py::arg("yerr"), py::arg("min_size") = 100, py::arg("tol") = 0.1,py::arg("tol_abs") = 1e-10, py::arg("verbose") = 1, py::arg("debug") = 0, py::arg("compress_grad") = 0, py::arg("sym") = 0, py::arg("knn") = 0, py::arg("seed") = 42
+    py::arg("kernel_spec"), py::arg("x"), py::arg("nns"), py::arg("yerr"), py::arg("min_size") = 100, py::arg("tol") = 0.1,py::arg("tol_abs") = 1e-10, py::arg("verbose") = 1, py::arg("debug") = 0, py::arg("compute_grad") = 0, py::arg("sym") = 0, py::arg("knn") = 0, py::arg("seed") = 42
   );
   solver.def("apply_inverse", [](Solver& self, Eigen::MatrixXd& x, bool in_place = false){
     if (in_place) {

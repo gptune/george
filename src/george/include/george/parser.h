@@ -541,7 +541,21 @@ kernels::Kernel* parse_kernel_spec (const py::object& kernel_spec) {
         break;
       }
 
+    case 14: {
+      
+      size_t ndim = py::int_(kernel_spec.attr("ndim"));
+      double log_rc = py::float_(kernel_spec.attr("log_rc"));
+      py::object py_kernel_base = py::object(kernel_spec.attr("kernel_base"));
+      kernels::Kernel* ck = parse_kernel_spec(py_kernel_base);
 
+
+      kernel = new kernels::WendlandC2Kernel(
+        log_rc,
+        ck,
+        ndim
+      );
+
+      break; }
     
     default:
       throw std::invalid_argument("unrecognized kernel");

@@ -250,6 +250,7 @@ class Model(object):
 
         """
         v = self.parameter_vector
+        print(v,'george hyperparameters')
         if include_frozen:
             v[:] = vector
         else:

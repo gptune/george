@@ -15,6 +15,7 @@ __all__ = [
     "ConstantKernel",
     "ExpSquaredKernel",
     "Matern32Kernel",
+    "WendlandC2Kernel",
     "PolynomialKernel",
     "DotProductKernel",
     "LCMKernel",
@@ -803,7 +804,6 @@ class ExpSquaredKernel (Kernel):
         self.min_block, self.max_block = map(np.array, zip(*block))
     
 
-
 class BaseMatern32Kernel (Model):
     parameter_names = ()
 
@@ -1068,110 +1068,60 @@ class LCMKernel(Kernel):
 
 
 
+class BaseWendlandC2Kernel (Model):
+    parameter_names = ("log_rc", )
+
+class WendlandC2Kernel (Kernel):
+
+    kernel_type = 14
+    stationary = True
+
+    def __init__(self,
+                 bounds=None,
+                 log_rc=0,
+                 kernel_base=None,
+                 ndim=1,
+                 axes=None):
+        
+        self.ndim = ndim
+        if axes is None:
+            axes = np.arange(ndim, dtype=int)
+        self.axes = axes
+
+        kwargs = dict(log_rc=log_rc)
+        if bounds is not None:
+            kwargs["bounds"] = bounds
+        base = BaseWendlandC2Kernel(**kwargs)
+        super(WendlandC2Kernel, self).__init__([(None, base),("kernel_base", kernel_base)])
+
+        # Common setup.
+        self.dirty = True
+    
+        def __repr__(self):
+            # A minimal textual representation
+            return ("WendlandC2Kernel("
+                    "ndim={0}, kernel_base={1})".format(self.ndim, repr(kernel_base)))
 
 
 
+    @property
+    def block(self):
+        if not self.blocked:
+            return None
+        return list(zip(self.min_block, self.max_block))
 
+    @block.setter
+    def block(self, block):
+        if block is None:
+            self.blocked = False
+            self.min_block = -np.inf + np.zeros(len(self.axes))
+            self.max_block = np.inf + np.zeros(len(self.axes))
+            return
 
+        block = np.atleast_2d(block)
+        if block.shape != (len(self.axes), 2):
+            raise ValueError("dimension mismatch in block specification")
+        self.blocked = True
+        self.min_block, self.max_block = map(np.array, zip(*block))
+    
 
-# class BaseLCMKernel(Model):
-#     parameter_names = ("logBK", )
-
-# class LCMKernel(Kernel):
-#     kernel_type = 13  # Must match the "case 13" above
-#     stationary = True
-#     block = None
-#     metric = None
-
-#     def __init__(self, logBK, children, T, Q, ndim=1, axes=None):
-#         self.logBK = logBK  # length T*Q*2
-#         self.T = T 
-#         self.Q = Q
-#         self.children = children
-
-#         self.ndim = ndim
-#         if axes is None:
-#             axes = np.arange(ndim, dtype=int)
-#         self.axes = axes
-
-#         kwargs = dict(logBK=logBK, )
-#         base = BaseLCMKernel(**kwargs)
-#         super(LCMKernel, self).__init__([
-#             (None, base),
-#         ] + [(f"child_{i}", c) for i, c in enumerate(children)]
-#         )
-#         self.dirty = True
-
-#     @property
-#     def full_size(self):
-#         """The total number of parameters (including frozen parameters)"""
-#         return len(self.T*self.Q*2)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# class BaseLCMKernel(Model):
-#     # If you keep parameter_names empty, it won't attempt the default loop
-#     parameter_names = ("logB", "logK")
-
-#     def __init__(self, T, Q, logB=None, logK=None):
-#         self.T = T
-#         self.Q = Q
-#         # Expect logB, logK as 1D arrays of length T*Q
-#         self.logB = np.array(logB, copy=True)
-#         self.logK = np.array(logK, copy=True)
-#         super(BaseLCMKernel, self).__init__()        
-
-    # @property
-    # def parameter_vector(self):
-    #     """
-    #     Flatten logB and logK into a single 1D vector
-    #     so that 'george' can do optimization on it.
-    #     """
-    #     return np.concatenate([self.logB, self.logK])
-
-    # @parameter_vector.setter
-    # def parameter_vector(self, v):
-    #     """
-    #     The inverse: reshape the 1D vector back into logB and logK.
-    #     """
-    #     # The total number of elements we expect
-    #     print('in parameter_vector: ',v,len(v),2*self.T * self.Q)
-    #     TQ = self.T * self.Q  
-    #     if len(v) != 2 * TQ:
-    #         raise ValueError("dimension mismatch in BaseLCMKernel parameter_vector")
-
-    #     # The first T*Q => logB, the next T*Q => logK
-    #     self.logB = v[:TQ]
-    #     self.logK = v[TQ:]
-    #     self.dirty = True
-
-# class LCMKernel(Kernel):
-#     kernel_type = 13
-
-#     def __init__(self, logB, logK, children, T, Q, ndim=1, axes=None):
-#         self.T = T
-#         self.Q = Q
-#         self.children = children
-#         self.ndim = ndim
-#         ...
-
-#         # Construct the "base" with arrays
-#         base = BaseLCMKernel(T, Q, logB=logB, logK=logK)
-#         # Pass that base to super(...) so george knows about it
-#         super(LCMKernel, self).__init__([
-#             (None, base),
-#         ] + [(f"child_{i}", c) for i, c in enumerate(children)]
-#         )
-#         self.dirty = True

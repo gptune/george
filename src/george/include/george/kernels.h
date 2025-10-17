@@ -2219,6 +2219,120 @@ private:
 };
 
 
+class WendlandC2Kernel : public Kernel {
+public:
+    WendlandC2Kernel (
+        double log_rc,
+        Kernel* kernel_base,
+        size_t ndim
+    ) :
+        kernel_base_(kernel_base),
+        ndim_(ndim)
+    {
+        rc_ = std::exp(log_rc);
+        size_ = 1 + kernel_base->size();
+        update_reparams();
+    };
+
+
+    ~WendlandC2Kernel() {
+        // If we truly own them, delete. Otherwise, manage accordingly.
+        delete kernel_base_;
+    }
+
+    // ########################
+
+    size_t get_ndim () const { return ndim_; };
+
+    double get_parameter (size_t i1) const {
+        size_t i=i1;
+        if(i==0){
+            return std::log(rc_); 
+        }else{
+            i-=1;
+            return kernel_base_->get_parameter(i);
+        }
+    };
+    void set_parameter (size_t i1, double value) {
+        size_t i=i1;
+        if(i==0){
+            rc_ = std::exp(value);
+            return;
+        }else{
+            i-=1;
+            kernel_base_->set_parameter(i,value);
+        }
+    };
+
+
+    double get_value (double r2) {
+        double r = sqrt(r2);
+        if(r/rc_>=1){
+            return 0;
+        }else{
+            return pow(1.0 - r/rc_,4) * (4*r/rc_+1);
+        }
+    };
+
+    double value (const double* x1, const double* x2) {
+        
+        double r2 = 0;
+        for (int i=0; i<ndim_; i++){
+            r2 += pow(x1[i]-x2[i],2);
+        }
+        double cval = kernel_base_->value(x1, x2);
+        return get_value(r2)*cval;
+    };
+
+
+    void gradient (const double* x1, const double* x2, const unsigned* which,
+                   double* grad) {
+        bool out = false;
+        size_t i, j, n = size();
+
+        double r2 = 0;
+        for (i=0; i<ndim_; i++){
+            r2 += pow(x1[i]-x2[i],2);
+        }
+        double r = sqrt(r2);
+        
+        bool any = false;
+        for (i = 0; i < size(); ++i) if (which[i]) { any = true; break; }
+        if (any) {
+            if(r>=rc_){
+              for (i = 0; i < n; ++i) grad[i]=0;
+            }else{
+                    
+              double cval = kernel_base_->value(x1, x2);
+              grad[0]=20*pow(r,2)/pow(rc_,3)*pow(1-r/rc_,3)*cval;
+
+              std::vector<double> cgrad; 
+              cgrad.resize(kernel_base_->size(), 0.0);
+              kernel_base_->gradient(x1, x2, &(which[1]), cgrad.data());
+              double val = value(x1, x2);
+              for (i = 1; i < n; ++i) grad[i] = cgrad[i]*val;
+            }    
+        }
+    };
+
+
+    size_t size () const { return size_; };
+
+    void update_reparams () {
+        
+    };
+
+    
+
+private:
+    size_t size_;
+    size_t ndim_;
+    Kernel* kernel_base_;
+    double rc_;
+};
+
+
+
 
 /**
  * A local coregionalization kernel (LCMKernel) storing B_{t,q} and K_{t,q} in *linear space*,
@@ -2376,18 +2490,20 @@ public:
         // Precompute child kernel values & child kernel gradients
         std::vector<double> child_vals(num_latent_);
         std::vector< std::vector<double> > child_grads(num_latent_);
-
+        const size_t TQ = num_tasks_ * num_latent_;
+        size_t offset = TQ*2;
         for (size_t q = 0; q < num_latent_; ++q) {
             child_vals[q] = children_[q]->value(x1_spatial.data(), x2_spatial.data());
 
             child_grads[q].resize(children_[q]->size(), 0.0);
             children_[q]->gradient(x1_spatial.data(), x2_spatial.data(),
-                                   which, child_grads[q].data());
+                                   &(which[offset]), child_grads[q].data());
+            size_t csize = children_[q]->size();
+            offset +=csize;
         }
 
-        const size_t TQ = num_tasks_ * num_latent_;
-        size_t offset = 0;
 
+        offset=0;
         // 1) partial wrt logB_{t,q} => B_{t,q} * partial wrt B_{t,q}
         for (size_t i = 0; i < TQ; ++i) {
             if (!which || which[offset + i]) {
@@ -2458,7 +2574,8 @@ public:
     }
 
     // Externally, B_ and K_ are log-parameters
-    double get_parameter(size_t i) const override {
+    double get_parameter(size_t i1) const override {
+        size_t i = i1;
         const size_t TQ = num_tasks_ * num_latent_;
         if (i < TQ) {
             // logB
@@ -2481,7 +2598,8 @@ public:
         throw std::out_of_range("LCMKernel::get_parameter: index out of range");
     }
 
-    void set_parameter(size_t i, double value) override {
+    void set_parameter(size_t i1, double value) override {
+        size_t i = i1;
         const size_t TQ = num_tasks_ * num_latent_;
         if (i < TQ) {
             // logB

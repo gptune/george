@@ -40,13 +40,13 @@ class HODLRSolver(BasicSolver):
         (default: ``42``)
     """
 
-    def __init__(self, kernel, min_size=100, tol=0.1, tol_abs=1e-10, verbose=0, debug=0, compress_grad=0, sym=0, knn=0, seed=42):
+    def __init__(self, kernel, min_size=100, tol=0.1, tol_abs=1e-10, verbose=0, debug=0, compute_grad=0, sym=0, knn=0, seed=42):
         self.min_size = min_size
         self.tol = tol
         self.tol_abs = tol_abs
         self.verbose = verbose
         self.debug = debug
-        self.compress_grad = compress_grad
+        self.compute_grad = compute_grad
         self.seed = seed
         self.sym = sym
         self.knn = knn
@@ -55,7 +55,7 @@ class HODLRSolver(BasicSolver):
     def compute(self, x, nns, yerr):
         self.solver = HODLRSolverInterface()
         self.solver.compute(self.kernel, x, nns, yerr,
-                            self.min_size, self.tol, self.tol_abs, self.verbose, self.debug, self.compress_grad, self.sym, self.knn, self.seed)
+                            self.min_size, self.tol, self.tol_abs, self.verbose, self.debug, self.compute_grad, self.sym, self.knn, self.seed)
         self._log_det = self.solver.log_determinant
         self.computed = self.solver.computed
 
