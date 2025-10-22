@@ -330,10 +330,7 @@ class GP(ModelSet):
 
         # Include the white noise term.
         yerr = np.sqrt(self._yerr2 + np.exp(self._call_white_noise(self._x)))
-        if isinstance(self.solver, HODLRSolver):
-            self.solver.compute(self._x, self._nns, yerr, **kwargs)
-        else:
-            self.solver.compute(self._x, yerr, **kwargs)
+        self.solver.compute(self._x, self._nns, yerr, **kwargs)
 
         self._const = -0.5 * (
             len(self._x) * np.log(2 * np.pi) + self.solver.log_determinant
@@ -502,7 +499,7 @@ class GP(ModelSet):
         n_k = n_wn + l
         l = len(self.kernel)
         if l:
-            if(self.solver_type is not HODLRSolver or self.solver_kwargs['model_sparse']==0):
+            if(self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0):
                 Kg = self.kernel.get_gradient(self._x)
                 grad[n_k : n_k + l] = 0.5 * np.einsum("ijk,ij", Kg, A)
 

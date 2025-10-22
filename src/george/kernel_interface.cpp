@@ -1,9 +1,17 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/eigen.h>
+#include <pybind11/stl.h>
 
 #include "george/parser.h"
 #include "george/kernels.h"
 #include "george/exceptions.h"
+
+#include <vector>
+#include <tuple>
+#include <Eigen/Sparse>
+
+
 
 namespace py = pybind11;
 
@@ -75,6 +83,47 @@ Docs...
     }
     return result;
   });
+ 
+
+interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, const std::vector<std::vector<size_t>>& neighbors) {
+    auto xp = x.unchecked<2>();
+    size_t n = xp.shape(0);
+    if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
+    
+    // Initialize a sparse matrix
+    Eigen::SparseMatrix<double> result(n, n);
+    
+    
+    // Use lists to store row, column and value for sparse representation
+    std::vector<Eigen::Triplet<double>> tripletList; // For holding non-zero elements
+    
+    for (size_t i = 0; i < n; ++i) {
+        // Calculate the covariance for the points in the neighborhood
+        double self_value = self.value(&(xp(i, 0)), &(xp(i, 0)));
+        tripletList.emplace_back(i, i, self_value); // Diagonal element
+
+        for (size_t j : neighbors[i]) { // Use the list of neighbors
+            if (i < j) { // Only compute for upper triangle
+                double value = self.value(&(xp(i, 0)), &(xp(j, 0)));
+                tripletList.emplace_back(i, j, value);
+                tripletList.emplace_back(j, i, value); // Symmetric entry
+            }
+        }
+    }
+    
+    result.setFromTriplets(tripletList.begin(), tripletList.end()); // Construct sparse matrix from triplet list
+
+    return result; // Make sure this returns a format compatible with Python (e.g., via PyEigen)
+});
+
+
+
+
+
+
+
+
+
 
   interface.def("value_diagonal", [](KernelInterface& self, py::array_t<double> x1, py::array_t<double> x2) {
     auto x1p = x1.unchecked<2>();
@@ -123,6 +172,50 @@ Docs...
     }
     return result;
   });
+
+
+  interface.def("gradient_sparse", [](KernelInterface& self, py::array_t<unsigned> which, py::array_t<double> x, const std::vector<std::vector<size_t>>& neighbors) {
+      auto xp = x.unchecked<2>();
+      size_t n = xp.shape(0);
+      size_t size = self.size();
+      if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
+      
+      // Initialize a sparse matrix for each gradient output
+      std::vector<Eigen::SparseMatrix<double>> result(size, Eigen::SparseMatrix<double>(n, n));
+
+      // Initialize triplet list for storing non-zero elements
+      std::vector<std::vector<Eigen::Triplet<double>>> tripletList(size);  // Size initialized
+
+      auto w = which.unchecked<1>();
+      unsigned* wp = (unsigned*)&(w(0));
+      std::vector<double> grad_vector(size);
+
+      for (size_t i = 0; i < n; ++i) {
+          // Calculate the covariance for the points in the neighborhood
+          self.gradient(&(xp(i, 0)), &(xp(i, 0)), wp, grad_vector.data());
+          for (size_t k = 0; k < size; ++k) {
+              tripletList[k].emplace_back(i, i, grad_vector[k]); // Diagonal element
+          }
+
+          for (size_t j : neighbors[i]) { // Use the list of neighbors
+              if (i < j) { // Only compute for upper triangle
+                  self.gradient(&(xp(i, 0)), &(xp(j, 0)), wp, grad_vector.data());
+                  for (size_t k = 0; k < size; ++k) {
+                      tripletList[k].emplace_back(i, j, grad_vector[k]);
+                      tripletList[k].emplace_back(j, i, grad_vector[k]); // Symmetric entry
+                  } 
+              }
+          }
+      }
+
+      // Construct sparse matrix from triplet list
+      for (size_t k = 0; k < size; ++k) {
+          result[k].setFromTriplets(tripletList[k].begin(), tripletList[k].end());
+      }
+
+      return result; // Return vector of sparse matrices
+  });
+
 
   interface.def("x1_gradient_general", [](KernelInterface& self, py::array_t<double> x1, py::array_t<double> x2) {
     auto x1p = x1.unchecked<2>();

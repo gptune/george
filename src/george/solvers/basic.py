@@ -5,7 +5,7 @@ __all__ = ["BasicSolver"]
 
 import numpy as np
 from scipy.linalg import cholesky, cho_solve
-from scipy.sparse import csc_matrix, issparse
+from scipy.sparse import csc_matrix, coo_matrix, issparse
 from scipy.sparse.linalg import splu
 from pdbridge import *
 import copy
@@ -20,14 +20,15 @@ class BasicSolver(object):
         the kernel function.
 
     """
-
-    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0):
+    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, debug=0, sym=0):
         self.kernel = kernel
         self._computed = False
         self._log_det = None
         self.verbose = verbose
         self.INT64 = INT64
         self.algo3d = algo3d
+        self.debug = debug
+        self.sym = sym
         self.compute_grad = compute_grad
         self.model_sparse = model_sparse
         self.Kg = None
@@ -59,7 +60,7 @@ class BasicSolver(object):
     def log_determinant(self, v):
         self._log_det = v
 
-    def compute(self, x, yerr):
+    def compute(self, x, nns, yerr):
         """
         Compute and factorize the covariance matrix.
 
@@ -71,18 +72,40 @@ class BasicSolver(object):
                 added in quadrature to the diagonal of the covariance matrix.
         """
         # Compute the kernel matrix.
-        K = self.kernel.get_value(x)
-        self._n = K.shape[0]     
 
-        if self.model_sparse == 1:       
-            K = csc_matrix(K) 
+
+        if self.model_sparse == 1:      
+            K = self.kernel.get_value(x,nns=nns) 
+            print('initial K.nnz',K.nnz)
+            K_coo=K.tocoo()
+            row_indices = K_coo.row
+            col_indices = K_coo.col
+            nonzero_mask = K_coo.data != 0
+            K = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K.shape)
+            print('final K.nnz',K.nnz)
+        else:
+            K = self.kernel.get_value(x)
+       
+        self._n = K.shape[0]     
 
         if self.model_sparse == 1 :
             diag_yerr = csc_matrix(np.diag(yerr ** 2))
             K = K + diag_yerr
             if(self.compute_grad==1):
-                Kg = self.kernel.get_gradient(x)          
-                self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
+                if self.model_sparse == 1:      
+                    Kgs = self.kernel.get_gradient(x,nns=nns) 
+                    for i in range(len(Kgs)):
+                        # print('initial Kgs[i].nnz',Kgs[i].nnz)
+                        K_coo=Kgs[i].tocoo()
+                        row_indices = K_coo.row
+                        col_indices = K_coo.col
+                        nonzero_mask = K_coo.data != 0
+                        Kgs[i] = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K_coo.shape)
+                        # print('final Kgs[i].nnz',Kgs[i].nnz)
+                    self.Kg = Kgs
+                else: 
+                    Kg = self.kernel.get_gradient(x)          
+                    self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
 
             # K_copy = copy.deepcopy(K)
             # K_dense = K_copy.toarray()

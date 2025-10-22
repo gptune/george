@@ -37,6 +37,7 @@ class Kernel(ModelSet):
 
     is_kernel = True
     kernel_type = -1
+    sparse = False
 
     # This function deals with weird behavior when performing arithmetic
     # operations with numpy scalars.
@@ -101,20 +102,24 @@ class Kernel(ModelSet):
     def __rmul__(self, b):
         return self.__mul__(b)
 
-    def get_value(self, x1, x2=None, diag=False):
+    def get_value(self, x1, x2=None, diag=False, nns=None):
         x1 = np.ascontiguousarray(x1, dtype=np.float64)
         if x2 is None:
             if diag:
                 return self.kernel.value_diagonal(x1, x1)
             else:
-                return self.kernel.value_symmetric(x1)
+                if nns is not None:
+                    return self.kernel.value_sparse(x1,nns)
+                else:
+                    return self.kernel.value_symmetric(x1)
+
         x2 = np.ascontiguousarray(x2, dtype=np.float64)
         if diag:
             return self.kernel.value_diagonal(x1, x2)
         else:
             return self.kernel.value_general(x1, x2)
 
-    def get_gradient(self, x1, x2=None, include_frozen=False):
+    def get_gradient(self, x1, x2=None, include_frozen=False, nns=None):
         mask = (
             np.ones(self.full_size, dtype=bool)
             if include_frozen else self.unfrozen_mask
@@ -122,7 +127,12 @@ class Kernel(ModelSet):
         which = mask.astype(np.uint32)
         x1 = np.ascontiguousarray(x1, dtype=np.float64)
         if x2 is None:
-            g = self.kernel.gradient_symmetric(which, x1)
+            if nns is not None:
+                g = self.kernel.gradient_sparse(which, x1, nns)
+                return [g[i] for i in range(len(g)) if mask[i]]
+            else: 
+                g = self.kernel.gradient_symmetric(which, x1)
+
         else:
             x2 = np.ascontiguousarray(x2, dtype=np.float64)
             g = self.kernel.gradient_general(which, x1, x2)
@@ -1075,6 +1085,7 @@ class WendlandC2Kernel (Kernel):
 
     kernel_type = 14
     stationary = True
+    sparse = True
 
     def __init__(self,
                  bounds=None,
