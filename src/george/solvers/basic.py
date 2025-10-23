@@ -86,8 +86,8 @@ class BasicSolver(object):
             print('final K.nnz',K.nnz)
         else:
             K = self.kernel.get_value(x)
-       end = time.time()
-       print(f"Time spent in assembling K: {end - start} seconds")
+        end = time.time()
+        print(f"Time spent in assembling K: {end - start} seconds")
 
         self._n = K.shape[0]     
 
