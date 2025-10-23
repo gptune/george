@@ -302,7 +302,7 @@ Args:
   );
   solver.def("apply_inverse", [](Solver& self, Eigen::MatrixXd& x, bool in_place = false){
     if (in_place) {
-      self.apply_inverse(x);
+      self.apply_inverse(x); 
       return x;
     }
     Eigen::MatrixXd alpha = x;

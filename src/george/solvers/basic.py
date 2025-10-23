@@ -10,6 +10,7 @@ from scipy.sparse.linalg import splu
 from pdbridge import *
 import copy
 import scipy
+import time
 
 
 class BasicSolver(object):
@@ -73,7 +74,7 @@ class BasicSolver(object):
         """
         # Compute the kernel matrix.
 
-
+        start = time.time()
         if self.model_sparse == 1:      
             K = self.kernel.get_value(x,nns=nns) 
             print('initial K.nnz',K.nnz)
@@ -85,13 +86,16 @@ class BasicSolver(object):
             print('final K.nnz',K.nnz)
         else:
             K = self.kernel.get_value(x)
-       
+       end = time.time()
+       print(f"Time spent in assembling K: {end - start} seconds")
+
         self._n = K.shape[0]     
 
         if self.model_sparse == 1 :
             diag_yerr = csc_matrix(np.diag(yerr ** 2))
             K = K + diag_yerr
             if(self.compute_grad==1):
+                start = time.time()
                 if self.model_sparse == 1:      
                     Kgs = self.kernel.get_gradient(x,nns=nns) 
                     for i in range(len(Kgs)):
@@ -106,6 +110,10 @@ class BasicSolver(object):
                 else: 
                     Kg = self.kernel.get_gradient(x)          
                     self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
+            
+                end = time.time()
+                print(f"Time spent in assembling Kgs: {end - start} seconds")
+
 
             # K_copy = copy.deepcopy(K)
             # K_dense = K_copy.toarray()
