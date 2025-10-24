@@ -92,8 +92,9 @@ class BasicSolver(object):
         self._n = K.shape[0]     
 
         if self.model_sparse == 1 :
-            diag_yerr = csc_matrix(np.diag(yerr ** 2))
-            K = K + diag_yerr
+            # diag_yerr = csc_matrix(np.diag(yerr ** 2))
+            # K = K + diag_yerr
+            K.setdiag(K.diagonal() + yerr**2)
             if(self.compute_grad==1):
                 start = time.time()
                 if self.model_sparse == 1:      
