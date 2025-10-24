@@ -35,6 +35,7 @@ public:
     virtual size_t get_ndim () const { return 0; }
     virtual void set_parameter (size_t i, double v) {};
     virtual double get_parameter (size_t i) const { return 0.0; };
+    virtual double get_cutoff () const { return 1.0; };
     virtual void set_metric_parameter (size_t i, double v) {};
     virtual void set_axis (size_t i, size_t v) {};
 };
@@ -2253,6 +2254,11 @@ public:
             return kernel_base_->get_parameter(i);
         }
     };
+
+    double get_cutoff () const {
+        return rc_; 
+    };
+
     void set_parameter (size_t i1, double value) {
         size_t i=i1;
         if(i==0){

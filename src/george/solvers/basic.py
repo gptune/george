@@ -78,12 +78,12 @@ class BasicSolver(object):
         if self.model_sparse == 1:      
             K = self.kernel.get_value(x,nns=nns) 
             print('initial K.nnz',K.nnz)
-            K_coo=K.tocoo()
-            row_indices = K_coo.row
-            col_indices = K_coo.col
-            nonzero_mask = K_coo.data != 0
-            K = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K.shape)
-            print('final K.nnz',K.nnz)
+            # K_coo=K.tocoo()
+            # row_indices = K_coo.row
+            # col_indices = K_coo.col
+            # nonzero_mask = K_coo.data != 0
+            # K = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K.shape)
+            # print('final K.nnz',K.nnz)
         else:
             K = self.kernel.get_value(x)
         end = time.time()
@@ -98,14 +98,14 @@ class BasicSolver(object):
                 start = time.time()
                 if self.model_sparse == 1:      
                     Kgs = self.kernel.get_gradient(x,nns=nns) 
-                    for i in range(len(Kgs)):
-                        # print('initial Kgs[i].nnz',Kgs[i].nnz)
-                        K_coo=Kgs[i].tocoo()
-                        row_indices = K_coo.row
-                        col_indices = K_coo.col
-                        nonzero_mask = K_coo.data != 0
-                        Kgs[i] = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K_coo.shape)
-                        # print('final Kgs[i].nnz',Kgs[i].nnz)
+                    # for i in range(len(Kgs)):
+                    #     # print('initial Kgs[i].nnz',Kgs[i].nnz)
+                    #     K_coo=Kgs[i].tocoo()
+                    #     row_indices = K_coo.row
+                    #     col_indices = K_coo.col
+                    #     nonzero_mask = K_coo.data != 0
+                    #     Kgs[i] = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K_coo.shape)
+                    #     # print('final Kgs[i].nnz',Kgs[i].nnz)
                     self.Kg = Kgs
                 else: 
                     Kg = self.kernel.get_gradient(x)          
@@ -190,7 +190,6 @@ class BasicSolver(object):
             ndarray or sparse matrix: The result of the operation.
         """
         if self.model_sparse == 1:
-            # If K was sparse, we need a different approach to apply the inverse
             if in_place:
                 superlu_solve(y, self.verbose)
                 return y

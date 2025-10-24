@@ -26,6 +26,8 @@ class KernelInterface {
     size_t ndim () const { return kernel_->get_ndim(); };
     size_t size () const { return kernel_->size(); };
     double value (const double* x1, const double* x2) const { return kernel_->value(x1, x2); };
+    double get_parameter (size_t i) const { return kernel_->get_parameter(i); };
+    double get_cutoff () const { return kernel_->get_cutoff(); };
     void gradient (const double* x1, const double* x2, const unsigned* which, double* grad) const {
       return kernel_->gradient(x1, x2, which, grad);
     };
@@ -85,15 +87,22 @@ Docs...
   });
  
 
-interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, const std::vector<std::vector<size_t>>& neighbors) {
+
+
+interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, py::array_t<int64_t> nbr_idx, py::array_t<int64_t> row_ptr) {
     auto xp = x.unchecked<2>();
     size_t n = xp.shape(0);
+    auto idx = nbr_idx.unchecked<1>();
+    auto ptr = row_ptr.unchecked<1>();
+
     if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
     
     // Initialize a sparse matrix
     Eigen::SparseMatrix<double> result(n, n);
-    
-    
+
+    // double rc = self.get_cutoff();
+    // std::cout<<"rc in kernel_interface value_sparse: "<<rc<<std::endl;
+
     // Use lists to store row, column and value for sparse representation
     std::vector<Eigen::Triplet<double>> tripletList; // For holding non-zero elements
     
@@ -102,7 +111,11 @@ interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, c
         double self_value = self.value(&(xp(i, 0)), &(xp(i, 0)));
         tripletList.emplace_back(i, i, self_value); // Diagonal element
 
-        for (size_t j : neighbors[i]) { // Use the list of neighbors
+        size_t start = ptr[i];
+        size_t end   = ptr[i + 1];
+
+        for (size_t k = start; k < end; ++k) {
+            size_t j = idx[k];
             if (i < j) { // Only compute for upper triangle
                 double value = self.value(&(xp(i, 0)), &(xp(j, 0)));
                 tripletList.emplace_back(i, j, value);
@@ -115,9 +128,6 @@ interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, c
 
     return result; // Make sure this returns a format compatible with Python (e.g., via PyEigen)
 });
-
-
-
 
 
 
@@ -174,8 +184,11 @@ interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, c
   });
 
 
-  interface.def("gradient_sparse", [](KernelInterface& self, py::array_t<unsigned> which, py::array_t<double> x, const std::vector<std::vector<size_t>>& neighbors) {
+  interface.def("gradient_sparse", [](KernelInterface& self, py::array_t<unsigned> which, py::array_t<double> x, py::array_t<int64_t> nbr_idx, py::array_t<int64_t> row_ptr) {
       auto xp = x.unchecked<2>();
+      auto idx = nbr_idx.unchecked<1>();
+      auto ptr = row_ptr.unchecked<1>();
+
       size_t n = xp.shape(0);
       size_t size = self.size();
       if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
@@ -197,7 +210,11 @@ interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, c
               tripletList[k].emplace_back(i, i, grad_vector[k]); // Diagonal element
           }
 
-          for (size_t j : neighbors[i]) { // Use the list of neighbors
+          size_t start = ptr[i];
+          size_t end   = ptr[i + 1];
+
+          for (size_t g = start; g < end; ++g) {
+              size_t j = idx[g];
               if (i < j) { // Only compute for upper triangle
                   self.gradient(&(xp(i, 0)), &(xp(j, 0)), wp, grad_vector.data());
                   for (size_t k = 0; k < size; ++k) {
@@ -259,6 +276,10 @@ interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, c
       }
   ));
 
+
+  interface.def("get_cutoff", [](const KernelInterface& self) {
+   return self.get_cutoff();
+  });
 
   //interface.def("__getstate__", [](const KernelInterface& self) {
   //  return std::make_tuple(self.kernel_spec());

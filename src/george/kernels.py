@@ -26,8 +26,8 @@ import numpy as np
 from .modeling import Model, ModelSet
 from .metrics import Metric, Subspace
 from .kernel_interface import KernelInterface
-
-
+from sklearn.neighbors import BallTree
+import time
 class Kernel(ModelSet):
     """
     The abstract kernel type. Every kernel implemented in George should be
@@ -38,6 +38,7 @@ class Kernel(ModelSet):
     is_kernel = True
     kernel_type = -1
     sparse = False
+    nns_saved = None
 
     # This function deals with weird behavior when performing arithmetic
     # operations with numpy scalars.
@@ -102,6 +103,25 @@ class Kernel(ModelSet):
     def __rmul__(self, b):
         return self.__mul__(b)
 
+
+    def neighbors_to_csr(self,neighbors):
+        # neighbors is the output from BallTree.query_radius
+        n = neighbors.shape[0]
+        lengths = np.fromiter((arr.size for arr in neighbors), count=n, dtype=np.int64)
+        row_ptr = np.empty(n + 1, dtype=np.int64)
+        row_ptr[0] = 0
+        np.cumsum(lengths, out=row_ptr[1:])
+
+        total = int(row_ptr[-1])
+        nbr_idx = np.empty(total, dtype=np.int64)
+
+        pos = 0
+        for arr in neighbors:  # note: this loop is over rows only (51k), not over nnz (millions)
+            m = arr.size
+            nbr_idx[pos:pos+m] = arr
+            pos += m
+        return nbr_idx, row_ptr
+
     def get_value(self, x1, x2=None, diag=False, nns=None):
         x1 = np.ascontiguousarray(x1, dtype=np.float64)
         if x2 is None:
@@ -109,7 +129,19 @@ class Kernel(ModelSet):
                 return self.kernel.value_diagonal(x1, x1)
             else:
                 if nns is not None:
-                    return self.kernel.value_sparse(x1,nns)
+                    tree = BallTree(x1)
+                    start = time.time()
+                    nns = tree.query_radius(x1, r=self.kernel.get_cutoff())
+                    self.nns_saved = nns
+                    nbr_idx, row_ptr = self.neighbors_to_csr(nns)
+                    end = time.time()
+                    # print(f"Time spent in nns: {end - start} seconds")
+                    
+                    start = time.time()
+                    K=self.kernel.value_sparse(x1, nbr_idx, row_ptr)
+                    end = time.time()
+                    # print(f"Time spent in value_sparse: {end - start} seconds")
+                    return K
                 else:
                     return self.kernel.value_symmetric(x1)
 
@@ -128,7 +160,8 @@ class Kernel(ModelSet):
         x1 = np.ascontiguousarray(x1, dtype=np.float64)
         if x2 is None:
             if nns is not None:
-                g = self.kernel.gradient_sparse(which, x1, nns)
+                nbr_idx, row_ptr = self.neighbors_to_csr(self.nns_saved)
+                g = self.kernel.gradient_sparse(which, x1, nbr_idx, row_ptr)
                 return [g[i] for i in range(len(g)) if mask[i]]
             else: 
                 g = self.kernel.gradient_symmetric(which, x1)
