@@ -87,7 +87,8 @@ class BasicSolver(object):
         else:
             K = self.kernel.get_value(x)
         end = time.time()
-        print(f"Time spent in assembling K: {end - start} seconds")
+        if(self.verbose==1):
+            print(f"Time spent in assembling K: {end - start} seconds")
 
         self._n = K.shape[0]     
 
@@ -113,7 +114,8 @@ class BasicSolver(object):
                     self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
             
                 end = time.time()
-                print(f"Time spent in assembling Kgs: {end - start} seconds")
+                if(self.verbose==1):
+                    print(f"Time spent in assembling Kgs: {end - start} seconds")
 
 
             # K_copy = copy.deepcopy(K)
