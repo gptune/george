@@ -627,10 +627,10 @@ auto start = std::chrono::high_resolution_clock::now();
       Eigen::MatrixXd Vtmp = V.block(0, 0, n_cols, rank);
       Eigen::HouseholderQR<Eigen::MatrixXd> qru(Utmp);
       Eigen::MatrixXd Qu = qru.householderQ() * Eigen::MatrixXd::Identity(Utmp.rows(), Utmp.cols());
-      Eigen::MatrixXd Ru = qru.matrixQR().topLeftCorner(Utmp.cols(), Utmp.cols()).triangularView<Eigen::Upper>();
+      Eigen::MatrixXd Ru = qru.matrixQR().topLeftCorner(Utmp.cols(), Utmp.cols()).template triangularView<Eigen::Upper>();
       Eigen::HouseholderQR<Eigen::MatrixXd> qrv(Vtmp);
       Eigen::MatrixXd Qv = qrv.householderQ() * Eigen::MatrixXd::Identity(Vtmp.rows(), Vtmp.cols());
-      Eigen::MatrixXd Rv = qrv.matrixQR().topLeftCorner(Vtmp.cols(), Vtmp.cols()).triangularView<Eigen::Upper>();
+      Eigen::MatrixXd Rv = qrv.matrixQR().topLeftCorner(Vtmp.cols(), Vtmp.cols()).template triangularView<Eigen::Upper>();
       Eigen::MatrixXd RuRv = Ru * Rv.transpose();
 
       // Compute the full SVD of RuRv
@@ -740,11 +740,11 @@ auto start = std::chrono::high_resolution_clock::now();
         // Update K and Qfactor to make sure Qfactor is unitary via QR
         Eigen::HouseholderQR<Eigen::MatrixXd> qr(Qfactor[0]);
         Qfactor[0] = qr.householderQ()*(Eigen::MatrixXd::Identity(Qfactor[0].rows(), min0));
-        K = qr.matrixQR().block(0,0,min0,Qfactor[0].cols()).triangularView<Eigen::Upper>()*K;
+        K = qr.matrixQR().block(0,0,min0,Qfactor[0].cols()).template triangularView<Eigen::Upper>()*K;
 
         Eigen::HouseholderQR<Eigen::MatrixXd> qr1(Qfactor[1]);
         Qfactor[1] = qr1.householderQ()*(Eigen::MatrixXd::Identity(Qfactor[1].rows(), min1));
-        K *= qr1.matrixQR().block(0,0,min1,Qfactor[1].cols()).triangularView<Eigen::Upper>().transpose();
+        K *= qr1.matrixQR().block(0,0,min1,Qfactor[1].cols()).template triangularView<Eigen::Upper>().transpose();
        
        
         // Compute the LL^T of I-K^T*K
