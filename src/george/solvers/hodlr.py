@@ -40,7 +40,7 @@ class HODLRSolver(BasicSolver):
         (default: ``42``)
     """
 
-    def __init__(self, kernel, min_size=100, tol=0.1, tol_abs=1e-10, verbose=0, debug=0, model_sparse=0, compute_grad=0, sym=0, knn=0, seed=42):
+    def __init__(self, kernel, min_size=100, tol=0.1, tol_abs=1e-10, verbose=0, debug=0, model_sparse=0, compute_grad=0, model_bpack=0, sym=0, knn=0, seed=42):
         super(HODLRSolver, self).__init__(kernel)
         self.min_size = min_size
         self.tol = tol
@@ -49,9 +49,16 @@ class HODLRSolver(BasicSolver):
         self.debug = debug
         self.model_sparse = model_sparse
         self.compute_grad = compute_grad
+        self.model_bpack = model_bpack
         self.seed = seed
         self.sym = sym
         self.knn = knn
+        if self.model_sparse==1:
+            raise ValueError("HODLRSolver doesn't support model_sparse==1. Use BasicSolver instead.")
+        if self.model_bpack==1:
+            raise ValueError("HODLRSolver doesn't support model_bpack==1. Use BasicSolver instead.")
+
+
 
     def compute(self, x, nns, yerr):
         self.solver = HODLRSolverInterface()

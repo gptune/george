@@ -437,7 +437,7 @@ class GP(ModelSet):
             raise
 
 
-        if((self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0) or self.solver_kwargs['debug']==1 ):
+        if((self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0 and self.solver_kwargs['model_bpack']==0) or self.solver_kwargs['debug']==1 ):
             if len(self.white_noise) or len(self.kernel):
                 K_inv = self.solver.get_inverse()
                 A = np.einsum("i,j", alpha, alpha) - K_inv
@@ -462,7 +462,7 @@ class GP(ModelSet):
         if l:
             wn = self._call_white_noise(self._x)
             wng = self._call_white_noise_gradient(self._x)
-            if(self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0):
+            if(self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0 and self.solver_kwargs['model_bpack']==0):
                 grad[n_wn : n_wn + l] = 0.5 * np.sum(
                     (np.exp(wn) * np.diag(A))[None, :] * wng, axis=1
                 )
@@ -499,7 +499,7 @@ class GP(ModelSet):
         n_k = n_wn + l
         l = len(self.kernel)
         if l:
-            if(self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0):
+            if(self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==0 and self.solver_kwargs['model_bpack']==0):
                 Kg = self.kernel.get_gradient(self._x)
                 grad[n_k : n_k + l] = 0.5 * np.einsum("ijk,ij", Kg, A)
 

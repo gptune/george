@@ -8,6 +8,7 @@ from scipy.linalg import cholesky, cho_solve
 from scipy.sparse import csc_matrix, coo_matrix, issparse
 from scipy.sparse.linalg import splu
 from pdbridge import *
+from dPy_BPACK_wrapper import *
 import copy
 import scipy
 import time
@@ -21,7 +22,7 @@ class BasicSolver(object):
         the kernel function.
 
     """
-    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, debug=0, sym=0):
+    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, model_bpack=0, debug=0, sym=0):
         self.kernel = kernel
         self._computed = False
         self._log_det = None
@@ -32,6 +33,7 @@ class BasicSolver(object):
         self.sym = sym
         self.compute_grad = compute_grad
         self.model_sparse = model_sparse
+        self.model_bpack = model_bpack
         self.Kg = None
         self.K = None
 
@@ -74,66 +76,103 @@ class BasicSolver(object):
         """
         # Compute the kernel matrix.
 
-        start = time.time()
-        if self.model_sparse == 1:      
-            K = self.kernel.get_value(x,nns=nns) 
-            print('initial K.nnz',K.nnz)
-            # K_coo=K.tocoo()
-            # row_indices = K_coo.row
-            # col_indices = K_coo.col
-            # nonzero_mask = K_coo.data != 0
-            # K = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K.shape)
-            # print('final K.nnz',K.nnz)
-        else:
-            K = self.kernel.get_value(x)
-        end = time.time()
-        if(self.verbose==1):
-            print(f"Time spent in assembling K: {end - start} seconds")
-
-        self._n = K.shape[0]     
-
-        if self.model_sparse == 1 :
-            # diag_yerr = csc_matrix(np.diag(yerr ** 2))
-            # K = K + diag_yerr
-            K.setdiag(K.diagonal() + yerr**2)
+        if self.model_bpack == 1:
+            start = time.time()
+            meta = {
+                "coordinates": x,
+                "kernel": self.kernel,
+                "yerr": yerr.astype(np.float64),
+                "id": 0
+            }
+            payload = {
+                "block_func_module": "user_block_funcs_kernel",
+                "block_func_name": "compute_block",
+                "meta": meta
+            }
+            bpack_factor(payload, self.verbose, fid=0)
+            end = time.time()
+            if(self.verbose==1):
+                print(f"Time spent in compress and invert K: {end - start} seconds")
             if(self.compute_grad==1):
                 start = time.time()
-                if self.model_sparse == 1:      
-                    Kgs = self.kernel.get_gradient(x,nns=nns) 
-                    # for i in range(len(Kgs)):
-                    #     # print('initial Kgs[i].nnz',Kgs[i].nnz)
-                    #     K_coo=Kgs[i].tocoo()
-                    #     row_indices = K_coo.row
-                    #     col_indices = K_coo.col
-                    #     nonzero_mask = K_coo.data != 0
-                    #     Kgs[i] = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K_coo.shape)
-                    #     # print('final Kgs[i].nnz',Kgs[i].nnz)
-                    self.Kg = Kgs
-                else: 
-                    Kg = self.kernel.get_gradient(x)          
-                    self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
-            
+                for g in range(self.kernel.full_size):
+                    meta = {
+                        "coordinates": x,
+                        "kernel": self.kernel,
+                        "yerr": yerr.astype(np.float64),
+                        "id": g+1
+                    }
+                    payload = {
+                        "block_func_module": "user_block_funcs_kernel",
+                        "block_func_name": "compute_block",
+                        "meta": meta
+                    }
+                    bpack_factor(payload, self.verbose, nofactor=True, fid=g+1)                    
                 end = time.time()
                 if(self.verbose==1):
-                    print(f"Time spent in assembling Kgs: {end - start} seconds")
+                    print(f"Time spent in compress Kgs: {end - start} seconds")
+        else:
+            start = time.time()
+            if self.model_sparse == 1:      
+                K = self.kernel.get_value(x,nns=nns) 
+                print('initial K.nnz',K.nnz)
+                # K_coo=K.tocoo()
+                # row_indices = K_coo.row
+                # col_indices = K_coo.col
+                # nonzero_mask = K_coo.data != 0
+                # K = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K.shape)
+                # print('final K.nnz',K.nnz)
+            else:
+                K = self.kernel.get_value(x)
+            end = time.time()
+            if(self.verbose==1):
+                print(f"Time spent in assembling K: {end - start} seconds")
+
+            self._n = x.shape[0]     
+
+            if self.model_sparse == 1 :
+                # diag_yerr = csc_matrix(np.diag(yerr ** 2))
+                # K = K + diag_yerr
+                K.setdiag(K.diagonal() + yerr**2)
+                if(self.compute_grad==1):
+                    start = time.time()
+                    if self.model_sparse == 1:      
+                        Kgs = self.kernel.get_gradient(x,nns=nns) 
+                        # for i in range(len(Kgs)):
+                        #     # print('initial Kgs[i].nnz',Kgs[i].nnz)
+                        #     K_coo=Kgs[i].tocoo()
+                        #     row_indices = K_coo.row
+                        #     col_indices = K_coo.col
+                        #     nonzero_mask = K_coo.data != 0
+                        #     Kgs[i] = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K_coo.shape)
+                        #     # print('final Kgs[i].nnz',Kgs[i].nnz)
+                        self.Kg = Kgs
+                    else: 
+                        Kg = self.kernel.get_gradient(x)          
+                        self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
+                
+                    end = time.time()
+                    if(self.verbose==1):
+                        print(f"Time spent in assembling Kgs: {end - start} seconds")
 
 
-            # K_copy = copy.deepcopy(K)
-            # K_dense = K_copy.toarray()
-            # self._factor = (cholesky(K_dense, overwrite_a=True, lower=False), False)
-            # print("logdet_dense: ",self._calculate_log_determinant(K_dense))
-        else:
-            eye = np.eye(K.shape[0])
-            K += eye * (yerr ** 2)  # Adjust K with yerr
-        
-        self.K=K
-        
-        # Factor the matrix using sparse Cholesky factorization if K is sparse
-        if self.model_sparse == 1:
-            # self._factor = splu(K)
-            superlu_factor(K, self.INT64, self.algo3d, self.verbose)
-        else:
-            self._factor = (cholesky(K, overwrite_a=True, lower=False), False)
+                # K_copy = copy.deepcopy(K)
+                # K_dense = K_copy.toarray()
+                # self._factor = (cholesky(K_dense, overwrite_a=True, lower=False), False)
+                # print("logdet_dense: ",self._calculate_log_determinant(K_dense))
+            else:
+                eye = np.eye(K.shape[0])
+                K += eye * (yerr ** 2)  # Adjust K with yerr
+            
+            self.K=K
+            
+            # Factor the matrix using sparse Cholesky factorization if K is sparse
+            if self.model_sparse == 1:
+                # self._factor = splu(K)
+                superlu_factor(K, self.INT64, self.algo3d, self.verbose)
+            else:
+                self._factor = (cholesky(K, overwrite_a=True, lower=False), False)
+
 
         self.log_determinant = self._calculate_log_determinant(K)
         # print("self.log_determinant: ",self.log_determinant)
@@ -152,28 +191,37 @@ class BasicSolver(object):
         Returns:
             float: The log-determinant value.
         """
-        if self.model_sparse == 1:
-            # For sparse K, splu doesn't provide logdet. Use slogdet instead. 
-            # sign, logdet = np.linalg.slogdet(K.toarray())
-            sign,logdet = superlu_logdet(self.verbose)
-            log_det = sign*logdet
-        else:
-            # For dense K
-            log_det = 2 * np.sum(np.log(np.diag(self._factor[0])))
+        if self.model_bpack == 1:
+            sign,logdet = bpack_logdet(self.verbose,fid=0)
+            log_det = sign*logdet            
+        else:    
+            if self.model_sparse == 1:
+                # For sparse K, splu doesn't provide logdet. Use slogdet instead. 
+                # sign, logdet = np.linalg.slogdet(K.toarray())
+                sign,logdet = superlu_logdet(self.verbose)
+                log_det = sign*logdet
+            else:
+                # For dense K
+                log_det = 2 * np.sum(np.log(np.diag(self._factor[0])))
         
         return log_det
 
     def apply_forward(self,x,i):
-        if self.model_sparse == 1:
-            if(i==0):
-                return self.K@x
-            else:
-                return self.Kg[i-1]@x    
+        if self.model_bpack == 1:
+            y=x.copy()
+            bpack_mult(y, "N", verbosity=self.verbose,fid=i)
+            return y
         else:
-            if(i==0):
-                return self.K@x    
+            if self.model_sparse == 1:
+                if(i==0):
+                    return self.K@x
+                else:
+                    return self.Kg[i-1]@x    
             else:
-                raise Exception('self.Kg has not been computed when self.model_sparse is 0 in apply_forward')        
+                if(i==0):
+                    return self.K@x    
+                else:
+                    raise Exception('self.Kg has not been computed when self.model_sparse is 0 in apply_forward')        
 
     def apply_inverse(self, y, in_place=False):
         """
@@ -192,16 +240,25 @@ class BasicSolver(object):
         Returns:
             ndarray or sparse matrix: The result of the operation.
         """
-        if self.model_sparse == 1:
+        if self.model_bpack == 1:
             if in_place:
-                superlu_solve(y, self.verbose)
+                bpack_solve(y, self.verbose,fid=0)
                 return y
             else:
                 x=copy.deepcopy(y)
-                superlu_solve(x, self.verbose)
+                bpack_solve(x, self.verbose,fid=0)
                 return x
         else:
-            return cho_solve(self._factor, y, overwrite_b=in_place)
+            if self.model_sparse == 1:
+                if in_place:
+                    superlu_solve(y, self.verbose)
+                    return y
+                else:
+                    x=copy.deepcopy(y)
+                    superlu_solve(x, self.verbose)
+                    return x
+            else:
+                return cho_solve(self._factor, y, overwrite_b=in_place)
 
     def dot_solve(self, y):
         """
@@ -232,10 +289,13 @@ class BasicSolver(object):
         Returns:
             ndarray or sparse matrix: Result of the multiplication with the Cholesky factor.
         """
-        if self.model_sparse == 1:
-            raise NotImplementedError("apply_sqrt is not implemented for sparse matrix yet")
-        else:
-            return np.dot(r, self._factor[0])  # Dense multiplication
+        if self.model_bpack == 1:
+            raise NotImplementedError("apply_sqrt is not implemented for model_bpack yet")
+        else:    
+            if self.model_sparse == 1:
+                raise NotImplementedError("apply_sqrt is not implemented for sparse matrix yet")
+            else:
+                return np.dot(r, self._factor[0])  # Dense multiplication
 
     def get_inverse(self):
         """
