@@ -7,11 +7,12 @@ import numpy as np
 from scipy.linalg import cholesky, cho_solve
 from scipy.sparse import csc_matrix, coo_matrix, issparse
 from scipy.sparse.linalg import splu
-from pdbridge import *
+# from pdbridge import *
 from dPy_BPACK_wrapper import *
 import copy
 import scipy
 import time
+import os
 
 
 class BasicSolver(object):
@@ -85,6 +86,7 @@ class BasicSolver(object):
                 "id": 0
             }
             payload = {
+                "block_func_filepath": os.path.abspath(__file__), ## this assumes user_block_funcs_kernel.py is located in the same directory as basic.py
                 "block_func_module": "user_block_funcs_kernel",
                 "block_func_name": "compute_block",
                 "meta": meta
@@ -103,6 +105,7 @@ class BasicSolver(object):
                         "id": g+1
                     }
                     payload = {
+                        "block_func_filepath": os.path.abspath(__file__),
                         "block_func_module": "user_block_funcs_kernel",
                         "block_func_name": "compute_block",
                         "meta": meta
