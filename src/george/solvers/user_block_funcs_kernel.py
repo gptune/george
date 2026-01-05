@@ -18,10 +18,10 @@ def compute_block(rows, cols, meta):
                 out[i, j] += yerr[ri] ** 2
     else:
         mask = np.zeros(K.full_size, dtype=bool)
-        mask[gid] = 1
+        mask[gid-1] = 1
         which = mask.astype(np.uint32)
         out = K.kernel.gradient_general(which, R, C)
-        out = out[:, :, gid]
+        out = out[:, :, gid-1]
 
 
     return out

@@ -78,6 +78,7 @@ class BasicSolver(object):
         # Compute the kernel matrix.
 
         if self.model_bpack == 1:
+            K=None
             start = time.time()
             meta = {
                 "coordinates": x,
