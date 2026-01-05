@@ -21,7 +21,7 @@ def compute_block(rows, cols, meta):
         mask[gid] = 1
         which = mask.astype(np.uint32)
         out = K.kernel.gradient_general(which, R, C)
-        out = G[:, :, gid]
+        out = out[:, :, gid]
 
 
     return out
