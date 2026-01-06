@@ -531,7 +531,7 @@ class GP(ModelSet):
                                 # print("quadratic_form sketching (no compression): ",quadratic_form)
                             
                             y = self.solver.apply_forward(u,k+1)
-                            z = self.solver.apply_inverse(y, in_place=False).flatten()
+                            z = self.solver.apply_inverse(y, in_place=False).flatten()                          
                             quadratic_form = 0.5*u.T @ z
                             # if(self.solver_kwargs['debug']==1):
                             #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
@@ -560,7 +560,7 @@ class GP(ModelSet):
                     tmp = 0.5 * np.einsum("ijk,ij", Kg, A)                
                     print(tmp,'grad_kernel_exact')
                     print(alpha_term-trace_estimates,'grad_kernel_random')
-
+        print("grad loglikelihood in george: ",grad)
         return grad
 
     def nll(self, vector, y, quiet=True):

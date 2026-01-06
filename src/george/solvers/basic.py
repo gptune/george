@@ -79,6 +79,7 @@ class BasicSolver(object):
 
         if self.model_bpack == 1:
             K=None
+            self._n = x.shape[0] 
             start = time.time()
             meta = {
                 "coordinates": x,
@@ -92,7 +93,7 @@ class BasicSolver(object):
                 "block_func_name": "compute_block",
                 "meta": meta
             }
-            bpack_factor(payload, self.verbose, fid=0)
+            bpack_factor(payload, fid=0)
             end = time.time()
             if(self.verbose==1):
                 print(f"Time spent in compress and invert K: {end - start} seconds")
@@ -111,7 +112,7 @@ class BasicSolver(object):
                         "block_func_name": "compute_block",
                         "meta": meta
                     }
-                    bpack_factor(payload, self.verbose, nofactor=True, fid=g+1)                    
+                    bpack_factor(payload, nofactor=True, fid=g+1)                    
                 end = time.time()
                 if(self.verbose==1):
                     print(f"Time spent in compress Kgs: {end - start} seconds")
@@ -196,7 +197,7 @@ class BasicSolver(object):
             float: The log-determinant value.
         """
         if self.model_bpack == 1:
-            sign,logdet = bpack_logdet(self.verbose,fid=0)
+            sign,logdet = bpack_logdet(fid=0)
             log_det = sign*logdet            
         else:    
             if self.model_sparse == 1:
@@ -212,8 +213,8 @@ class BasicSolver(object):
 
     def apply_forward(self,x,i):
         if self.model_bpack == 1:
-            y=x.copy()
-            bpack_mult(y, "N", verbosity=self.verbose,fid=i)
+            y=bpack_mult(x, "N", fid=i)
+            # print("in apply apply_forward:",np.linalg.norm(x),np.linalg.norm(y))
             return y
         else:
             if self.model_sparse == 1:
@@ -245,12 +246,11 @@ class BasicSolver(object):
             ndarray or sparse matrix: The result of the operation.
         """
         if self.model_bpack == 1:
+            x = bpack_solve(y,fid=0)
             if in_place:
-                bpack_solve(y, self.verbose,fid=0)
+                np.copyto(y, x)
                 return y
             else:
-                x=copy.deepcopy(y)
-                bpack_solve(x, self.verbose,fid=0)
                 return x
         else:
             if self.model_sparse == 1:
@@ -307,3 +307,11 @@ class BasicSolver(object):
         gradients, but it is not recommended in general.
         """
         return self.apply_inverse(np.eye(self._n), in_place=True)
+
+
+    def get_full(self,i):
+        """
+        Get the dense covariance matrix or its derivative. This is used for computing
+        gradients, but it is not recommended in general.
+        """
+        return self.apply_forward(np.eye(self._n), i=i)

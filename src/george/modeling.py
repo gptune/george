@@ -250,7 +250,8 @@ class Model(object):
 
         """
         v = self.parameter_vector
-        print(v,'george hyperparameters')
+        with np.printoptions(suppress=False, formatter={'float_kind': '{:.6e}'.format}):
+            print(v, "george hyperparameters")
         if include_frozen:
             v[:] = vector
         else:
