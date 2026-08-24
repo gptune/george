@@ -507,7 +507,7 @@ class GP(ModelSet):
                 alpha_term = np.zeros(l)
                 for k in range(l):
                     y = self.solver.apply_forward(alpha,k+1)
-                    alpha_term[k]=0.5*np.dot(y.T, alpha[:,None])
+                    alpha_term[k] = 0.5 * np.dot(np.ravel(y), np.ravel(alpha))
 
                 trace_estimates = np.zeros(l)
 
