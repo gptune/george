@@ -125,7 +125,7 @@ class Metric(Model):
     def __repr__(self):
         vector = self.get_parameter_vector(include_frozen=True)
         if self.metric_type == 0:
-            params = ["{0}".format(float(np.exp(vector)))]
+            params = ["{0}".format(float(np.exp(vector).item()))]
         elif self.metric_type == 1:
             params = ["{0}".format(repr(np.exp(vector)))]
         elif self.metric_type == 2:
