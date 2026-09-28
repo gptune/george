@@ -2310,13 +2310,16 @@ public:
             }else{
                     
               double cval = kernel_base_->value(x1, x2);
-              grad[0]=20*pow(r,2)/pow(rc_,3)*pow(1-r/rc_,3)*cval;
+              // the parameter is log(rc): d/dlog(rc) of (1-s)^4*(4s+1) with s=r/rc is 20*s^2*(1-s)^3
+              double s = r/rc_;
+              grad[0]=20*pow(s,2)*pow(1-s,3)*cval;
 
-              std::vector<double> cgrad; 
+              // the base kernel parameters only enter through cval: grad = Wendland(r) * d(cval)
+              std::vector<double> cgrad;
               cgrad.resize(kernel_base_->size(), 0.0);
               kernel_base_->gradient(x1, x2, &(which[1]), cgrad.data());
-              double val = value(x1, x2);
-              for (i = 1; i < n; ++i) grad[i] = cgrad[i]*val;
+              double wval = get_value(r2);
+              for (i = 1; i < n; ++i) grad[i] = cgrad[i-1]*wval;
             }    
         }
     };

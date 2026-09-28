@@ -445,7 +445,17 @@ class GP(ModelSet):
         # Compute each component of the gradient.
         grad = np.empty(len(self))
         n_mean = 0
-        nvec = 10    
+        nvec = 10
+
+        # Sparse (SuperLU) solver: Hutchinson trace estimates tr(K^-1 dK) ~ mean_i z_i^T dK u_i with
+        # z_i = K^-1 u_i. The same probes u_i are used in every call so the estimated gradient is a
+        # deterministic, smooth function of the parameters (L-BFGS line searches need that), and
+        # the z_i come from one multi-RHS solve shared by all parameters.
+        sparse_probes = (self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==1
+                         and self.solver_kwargs['model_bpack']==0 and self.solver_kwargs['debug']==0)
+        if sparse_probes:
+            U = np.random.default_rng(0).choice([-1.0, 1.0], size=(alpha.shape[0], self.solver.nprobe))
+            Z = self.solver.apply_inverse(U, in_place=False).reshape(U.shape)
 
         l = len(self.mean)
         if l:
@@ -476,17 +486,20 @@ class GP(ModelSet):
 
                 ########## YL: Note that the standard and symmetric trace estimators are the same for the whitenoise
                 trace_estimates = np.zeros(l)
-                for k in range(l):
-                    trace_k = 0.0
-                    for _ in range(nvec):
-                        # Generate a random vector u_l with entries in {-1, 1}
-                        u = np.random.choice([1, -1], size=alpha.shape[0])
-                        y = t*u
-                        z = self.solver.apply_inverse(y, in_place=False).flatten()
-                        quadratic_form = 0.5*u.T @ z
-                        trace_k += quadratic_form
-                    # Average over N samples
-                    trace_estimates[k] = trace_k / nvec
+                if(sparse_probes):
+                    trace_estimates[0] = 0.5*np.mean(np.sum(t[:, None]*U*Z, axis=0))
+                else:
+                    for k in range(l):
+                        trace_k = 0.0
+                        for _ in range(nvec):
+                            # Generate a random vector u_l with entries in {-1, 1}
+                            u = np.random.choice([1, -1], size=alpha.shape[0])
+                            y = t*u
+                            z = self.solver.apply_inverse(y, in_place=False).flatten()
+                            quadratic_form = 0.5*u.T @ z
+                            trace_k += quadratic_form
+                        # Average over N samples
+                        trace_estimates[k] = trace_k / nvec
                 grad[n_wn : n_wn + l] =alpha_term-trace_estimates
 
                 if(self.solver_kwargs['debug']==1):
@@ -516,43 +529,47 @@ class GP(ModelSet):
                     K = self.solver.get_full(0)
                     L = np.linalg.cholesky(K)
 
-                for k in range(l):
-                    trace_k = 0.0
-                    trace_k_sym = 0.0
-                    for _ in range(nvec):
+                if(sparse_probes):
+                    for k in range(l):
+                        trace_estimates[k] = 0.5*np.mean(np.sum(self.solver.apply_forward(U, k+1)*Z, axis=0))
+                else:
+                    for k in range(l):
+                        trace_k = 0.0
+                        trace_k_sym = 0.0
+                        for _ in range(nvec):
 
-                        u = np.random.choice([1, -1], size=alpha.shape[0])
+                            u = np.random.choice([1, -1], size=alpha.shape[0])
                         
-                        if(self.solver_kwargs['sym']==0):                      
-                            if(self.solver_kwargs['debug']==1):  
-                                y = np.linalg.solve(L, Kg[:, :, k] @ u)
-                                x = np.linalg.solve(L.T, y)
-                                quadratic_form = 0.5*u.T @ x
-                                # print("quadratic_form sketching (no compression): ",quadratic_form)
+                            if(self.solver_kwargs['sym']==0):                      
+                                if(self.solver_kwargs['debug']==1):  
+                                    y = np.linalg.solve(L, Kg[:, :, k] @ u)
+                                    x = np.linalg.solve(L.T, y)
+                                    quadratic_form = 0.5*u.T @ x
+                                    # print("quadratic_form sketching (no compression): ",quadratic_form)
                             
-                            y = self.solver.apply_forward(u,k+1)
-                            z = self.solver.apply_inverse(y, in_place=False).flatten()                          
-                            quadratic_form = 0.5*u.T @ z
-                            # if(self.solver_kwargs['debug']==1):
-                            #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
-                        else:
-                            ######### Note that L and W are different WW^T is not a Cholesky, so the following two quadratic_form shouldn't match     
-                            if(self.solver_kwargs['debug']==1):    
-                                quadratic_form = 0.5*u.T @ np.linalg.solve(L, Kg[:, :, k] @ np.linalg.solve(L.T, u)) 
-                                # print("quadratic_form sketching (no compression): ",quadratic_form)
+                                y = self.solver.apply_forward(u,k+1)
+                                z = self.solver.apply_inverse(y, in_place=False).flatten()                          
+                                quadratic_form = 0.5*u.T @ z
+                                # if(self.solver_kwargs['debug']==1):
+                                #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
+                            else:
+                                ######### Note that L and W are different WW^T is not a Cholesky, so the following two quadratic_form shouldn't match     
+                                if(self.solver_kwargs['debug']==1):    
+                                    quadratic_form = 0.5*u.T @ np.linalg.solve(L, Kg[:, :, k] @ np.linalg.solve(L.T, u)) 
+                                    # print("quadratic_form sketching (no compression): ",quadratic_form)
                             
-                            y = self.solver.apply_inverse_sym_W_transpose(u, in_place=False)
-                            # y = np.linalg.solve(L.T, u)
-                            z = self.solver.apply_forward(y,k+1)
-                            quadratic_form = 0.5*y.T @ z
-                            # if(self.solver_kwargs['debug']==1):
-                            #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
+                                y = self.solver.apply_inverse_sym_W_transpose(u, in_place=False)
+                                # y = np.linalg.solve(L.T, u)
+                                z = self.solver.apply_forward(y,k+1)
+                                quadratic_form = 0.5*y.T @ z
+                                # if(self.solver_kwargs['debug']==1):
+                                #     print("quadratic_form sketching (hodlr): ",quadratic_form.flatten()[0])
                         
 
-                        trace_k += quadratic_form
+                            trace_k += quadratic_form
 
-                    # Average over N samples
-                    trace_estimates[k] = trace_k / nvec
+                        # Average over N samples
+                        trace_estimates[k] = trace_k / nvec
                 grad[n_k : n_k + l] =alpha_term-trace_estimates
 
                 if(self.solver_kwargs['debug']==1):
@@ -562,6 +579,36 @@ class GP(ModelSet):
                     print(alpha_term-trace_estimates,'grad_kernel_random')
         print("grad loglikelihood in george: ",grad)
         return grad
+
+    def fisher_information(self, quiet=False):
+        """
+        Fisher information matrix of the log-likelihood (the expected negative Hessian) with respect to
+        the parameters returned by :func:`GP.get_parameter_vector`:
+        F_ij = 0.5 tr(K^-1 dK/dtheta_i K^-1 dK/dtheta_j). Only implemented for the sparse (SuperLU)
+        solver, where the traces are estimated with the same fixed probes u_k as the gradient:
+        F_ij ~ 0.5 mean_k (dK_i K^-1 u_k)^T (K^-1 dK_j u_k), which takes 1 + len(self) multi-RHS
+        solves. You must call :func:`GP.compute` before this function.
+        """
+        if not (self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==1 and self.solver_kwargs['model_bpack']==0):
+            raise NotImplementedError("fisher_information is only implemented for the sparse solver")
+        if len(self.mean):
+            raise NotImplementedError("fisher_information does not support fitted mean parameters")
+        if not self.recompute(quiet=quiet):
+            return np.full((len(self), len(self)), np.nan)
+
+        U = np.random.default_rng(0).choice([-1.0, 1.0], size=(self._x.shape[0], self.solver.nprobe))
+        Z = self.solver.apply_inverse(U, in_place=False).reshape(U.shape)
+        # the derivative matrices dK/dtheta_i applied to blocks of vectors, in the order of the parameter vector
+        derivatives = []
+        if len(self.white_noise):
+            t = ((np.exp(self._call_white_noise(self._x))) * self._call_white_noise_gradient(self._x)).flatten()
+            derivatives.append(lambda V: t[:, None] * V)
+        for k in range(len(self.kernel)):
+            derivatives.append(lambda V, k=k: self.solver.apply_forward(V, k+1))
+        W = [dK(Z) for dK in derivatives]
+        S = [self.solver.apply_inverse(dK(U), in_place=False).reshape(U.shape) for dK in derivatives]
+        F = np.array([[0.5*np.mean(np.sum(Wi*Sj, axis=0)) for Sj in S] for Wi in W])
+        return 0.5*(F + F.T)
 
     def nll(self, vector, y, quiet=True):
         self.set_parameter_vector(vector)

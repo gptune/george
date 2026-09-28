@@ -9,6 +9,7 @@ from scipy.sparse import csc_matrix, coo_matrix, issparse
 from scipy.sparse.linalg import splu
 # from pdbridge import *
 from dPy_BPACK_wrapper import *
+from ..metrics import Metric
 import copy
 import scipy
 import time
@@ -23,8 +24,9 @@ class BasicSolver(object):
         the kernel function.
 
     """
-    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, model_bpack=0, debug=0, sym=0):
+    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, model_bpack=0, debug=0, sym=0, nprobe=10, bpack_scaled_geometry=0):
         self.kernel = kernel
+        self.nprobe = nprobe # number of random probe vectors for the trace terms of the sparse gradient
         self._computed = False
         self._log_det = None
         self.verbose = verbose
@@ -35,8 +37,45 @@ class BasicSolver(object):
         self.compute_grad = compute_grad
         self.model_sparse = model_sparse
         self.model_bpack = model_bpack
+        self.bpack_scaled_geometry = bpack_scaled_geometry # whether to divide each dimension of the points passed to butterflypack by the kernel length scale
         self.Kg = None
         self.K = None
+
+    def _bpack_meta(self, x, yerr, gid):
+        """
+        The metadata passed to butterflypack. ``coordinates`` are the points used to build the
+        butterflypack cluster tree, while the kernel entries are always evaluated with the original
+        points (``kernel_coordinates`` if present, otherwise ``coordinates``). With
+        bpack_scaled_geometry=1, each dimension of ``coordinates`` is divided by the (axis-aligned)
+        kernel length scale, so that the admissibility condition sees the same distances as the
+        anisotropic kernel.
+        """
+        meta = {
+            "coordinates": x,
+            "kernel": self.kernel,
+            "yerr": yerr.astype(np.float64),
+            "id": gid
+        }
+        if self.bpack_scaled_geometry == 1:
+            meta["coordinates"] = np.ascontiguousarray(x * self._inverse_lengthscales(x.shape[1]), dtype=np.float64)
+            meta["kernel_coordinates"] = x
+        return meta
+
+    def _inverse_lengthscales(self, ndim):
+        metrics = []
+        stack = [self.kernel]
+        while stack:
+            k = stack.pop()
+            if isinstance(k, Metric):
+                metrics.append(k)
+            elif hasattr(k, "models"):
+                stack.extend(k.models.values())
+        if len(metrics) != 1 or metrics[0].metric_type == 2:
+            raise NotImplementedError("bpack_scaled_geometry requires a kernel with exactly one axis-aligned or isotropic metric")
+        metric = metrics[0]
+        scale = np.ones(ndim)
+        scale[list(metric.axes)] = 1.0 / np.sqrt(np.diag(metric.to_matrix()))
+        return scale
 
     @property
     def computed(self):
@@ -81,12 +120,9 @@ class BasicSolver(object):
             K=None
             self._n = x.shape[0] 
             start = time.time()
-            meta = {
-                "coordinates": x,
-                "kernel": self.kernel,
-                "yerr": yerr.astype(np.float64),
-                "id": 0
-            }
+            meta = self._bpack_meta(x, yerr, 0)
+            if(self.verbose==1 and self.bpack_scaled_geometry==1):
+                print("bpack scaled geometry, inverse length scales: ", self._inverse_lengthscales(x.shape[1]))
             payload = {
                 "block_func_filepath": os.path.abspath(__file__), ## this assumes user_block_funcs_kernel.py is located in the same directory as basic.py
                 "block_func_module": "user_block_funcs_kernel",
@@ -100,12 +136,7 @@ class BasicSolver(object):
             if(self.compute_grad==1):
                 start = time.time()
                 for g in range(self.kernel.full_size):
-                    meta = {
-                        "coordinates": x,
-                        "kernel": self.kernel,
-                        "yerr": yerr.astype(np.float64),
-                        "id": g+1
-                    }
+                    meta = self._bpack_meta(x, yerr, g+1)
                     payload = {
                         "block_func_filepath": os.path.abspath(__file__),
                         "block_func_module": "user_block_funcs_kernel",
@@ -139,26 +170,10 @@ class BasicSolver(object):
                 # diag_yerr = csc_matrix(np.diag(yerr ** 2))
                 # K = K + diag_yerr
                 K.setdiag(K.diagonal() + yerr**2)
-                if(self.compute_grad==1):
-                    start = time.time()
-                    if self.model_sparse == 1:      
-                        Kgs = self.kernel.get_gradient(x,nns=nns) 
-                        # for i in range(len(Kgs)):
-                        #     # print('initial Kgs[i].nnz',Kgs[i].nnz)
-                        #     K_coo=Kgs[i].tocoo()
-                        #     row_indices = K_coo.row
-                        #     col_indices = K_coo.col
-                        #     nonzero_mask = K_coo.data != 0
-                        #     Kgs[i] = csc_matrix((K_coo.data[nonzero_mask], (row_indices[nonzero_mask], col_indices[nonzero_mask])), shape=K_coo.shape)
-                        #     # print('final Kgs[i].nnz',Kgs[i].nnz)
-                        self.Kg = Kgs
-                    else: 
-                        Kg = self.kernel.get_gradient(x)          
-                        self.Kg = [csc_matrix(Kg[:, :, i]) for i in range(Kg.shape[-1])]                
-                
-                    end = time.time()
-                    if(self.verbose==1):
-                        print(f"Time spent in assembling Kgs: {end - start} seconds")
+                # the gradient matrices are only needed by grad_log_likelihood, not by the
+                # likelihood-only evaluations of the line search, so assemble them on first use
+                self.Kg = None
+                self._Kg_args = (x, nns)
 
 
                 # K_copy = copy.deepcopy(K)
@@ -211,6 +226,20 @@ class BasicSolver(object):
         
         return log_det
 
+    def get_Kg(self):
+        """
+        The gradient matrices dK/dtheta of the sparse covariance matrix, assembled on first use
+        after compute().
+        """
+        if self.Kg is None:
+            start = time.time()
+            x, nns = self._Kg_args
+            self.Kg = self.kernel.get_gradient(x,nns=nns)
+            end = time.time()
+            if(self.verbose==1):
+                print(f"Time spent in assembling Kgs: {end - start} seconds")
+        return self.Kg
+
     def apply_forward(self,x,i):
         if self.model_bpack == 1:
             y=bpack_mult(x, "N", fid=i)
@@ -221,7 +250,7 @@ class BasicSolver(object):
                 if(i==0):
                     return self.K@x
                 else:
-                    return self.Kg[i-1]@x    
+                    return self.get_Kg()[i-1]@x
             else:
                 if(i==0):
                     return self.K@x    

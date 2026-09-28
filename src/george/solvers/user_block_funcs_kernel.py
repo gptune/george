@@ -1,7 +1,7 @@
 import numpy as np
 
 def compute_block(rows, cols, meta):
-    xyz = meta["coordinates"]
+    xyz = meta.get("kernel_coordinates", meta["coordinates"]) # "coordinates" may be rescaled for the butterflypack tree only
     K = meta["kernel"]
     yerr = meta["yerr"]
     gid = meta["id"]

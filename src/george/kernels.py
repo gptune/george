@@ -22,6 +22,7 @@ __all__ = [
 ]
 
 import numpy as np
+from scipy.sparse import csc_matrix
 
 from .modeling import Model, ModelSet
 from .metrics import Metric, Subspace
@@ -39,6 +40,10 @@ class Kernel(ModelSet):
     kernel_type = -1
     sparse = False
     nns_saved = None
+    # compactly supported kernels: the largest cutoff the kernel will take (e.g. the upper bound of a
+    # hyperparameter optimization), so that the neighbours are searched once (see sparse_pattern)
+    max_cutoff = None
+    _pattern_cache = None
 
     # This function deals with weird behavior when performing arithmetic
     # operations with numpy scalars.
@@ -111,16 +116,29 @@ class Kernel(ModelSet):
         row_ptr = np.empty(n + 1, dtype=np.int64)
         row_ptr[0] = 0
         np.cumsum(lengths, out=row_ptr[1:])
-
-        total = int(row_ptr[-1])
-        nbr_idx = np.empty(total, dtype=np.int64)
-
-        pos = 0
-        for arr in neighbors:  # note: this loop is over rows only (51k), not over nnz (millions)
-            m = arr.size
-            nbr_idx[pos:pos+m] = arr
-            pos += m
+        nbr_idx = np.concatenate(neighbors).astype(np.int64, copy=False) if n > 0 else np.empty(0, dtype=np.int64)
         return nbr_idx, row_ptr
+
+    def sparse_pattern(self, x1):
+        """
+        Sparsity pattern (indices, indptr of a CSC matrix, symmetric) of the covariance matrix of a
+        compactly supported kernel at the points x1: the diagonal and the pairs within the current
+        cutoff. The candidate neighbours are searched once for a set of points, within
+        max(cutoff, max_cutoff), and the pattern of the last cutoff is kept, so that the same arrays
+        are returned (at no cost) as long as the cutoff does not change.
+        """
+        rc = self.kernel.get_cutoff()
+        cache = self._pattern_cache
+        if (cache is None or cache['x'].shape != x1.shape or not np.array_equal(cache['x'], x1)
+                or rc > cache['radius']):
+            radius = max(rc, self.max_cutoff or 0.0)
+            nbr_idx, row_ptr = self.neighbors_to_csr(BallTree(x1).query_radius(x1, r=radius))
+            cache = {'x': x1.copy(), 'radius': radius, 'nbr_idx': nbr_idx, 'row_ptr': row_ptr, 'cutoff': None}
+            self._pattern_cache = cache
+        if cache['cutoff'] != rc:
+            cache['indices'], cache['indptr'] = self.kernel.sparse_pattern(x1, cache['nbr_idx'], cache['row_ptr'], rc)
+            cache['cutoff'] = rc
+        return cache['indices'], cache['indptr']
 
     def get_value(self, x1, x2=None, diag=False, nns=None):
         x1 = np.ascontiguousarray(x1, dtype=np.float64)
@@ -129,19 +147,10 @@ class Kernel(ModelSet):
                 return self.kernel.value_diagonal(x1, x1)
             else:
                 if nns is not None:
-                    tree = BallTree(x1)
-                    start = time.time()
-                    nns = tree.query_radius(x1, r=self.kernel.get_cutoff())
-                    self.nns_saved = nns
-                    nbr_idx, row_ptr = self.neighbors_to_csr(nns)
-                    end = time.time()
-                    # print(f"Time spent in nns: {end - start} seconds")
-                    
-                    start = time.time()
-                    K=self.kernel.value_sparse(x1, nbr_idx, row_ptr)
-                    end = time.time()
-                    # print(f"Time spent in value_sparse: {end - start} seconds")
-                    return K
+                    # sparse (compactly supported kernel): the pattern is symmetric, so its CSR arrays are the CSC ones
+                    indices, indptr = self.sparse_pattern(x1)
+                    values = self.kernel.value_sparse(x1, indices, indptr)
+                    return csc_matrix((values, indices, indptr), shape=(x1.shape[0], x1.shape[0]))
                 else:
                     return self.kernel.value_symmetric(x1)
 
@@ -160,9 +169,9 @@ class Kernel(ModelSet):
         x1 = np.ascontiguousarray(x1, dtype=np.float64)
         if x2 is None:
             if nns is not None:
-                nbr_idx, row_ptr = self.neighbors_to_csr(self.nns_saved)
-                g = self.kernel.gradient_sparse(which, x1, nbr_idx, row_ptr)
-                return [g[i] for i in range(len(g)) if mask[i]]
+                indices, indptr = self.sparse_pattern(x1)
+                g = self.kernel.gradient_sparse(which, x1, indices, indptr)
+                return [csc_matrix((g[i], indices, indptr), shape=(x1.shape[0], x1.shape[0])) for i in range(len(g)) if mask[i]]
             else: 
                 g = self.kernel.gradient_symmetric(which, x1)
 

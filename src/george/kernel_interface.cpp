@@ -8,6 +8,7 @@
 #include "george/exceptions.h"
 
 #include <vector>
+#include <algorithm>
 #include <tuple>
 #include <Eigen/Sparse>
 
@@ -61,9 +62,13 @@ Docs...
     if (x1p.shape(1) != py::ssize_t(self.ndim()) || x2p.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
     py::array_t<double> result({n1, n2});
     auto resultp = result.mutable_unchecked<2>();
-    for (size_t i = 0; i < n1; ++i) {
-      for (size_t j = 0; j < n2; ++j) {
-        resultp(i, j) = self.value(&(x1p(i, 0)), &(x2p(j, 0)));
+    {
+      py::gil_scoped_release release;
+      #pragma omp parallel for schedule(static)
+      for (py::ssize_t i = 0; i < py::ssize_t(n1); ++i) {
+        for (size_t j = 0; j < n2; ++j) {
+          resultp(i, j) = self.value(&(x1p(i, 0)), &(x2p(j, 0)));
+        }
       }
     }
     return result;
@@ -85,52 +90,6 @@ Docs...
     }
     return result;
   });
- 
-
-
-
-interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, py::array_t<int64_t> nbr_idx, py::array_t<int64_t> row_ptr) {
-    auto xp = x.unchecked<2>();
-    size_t n = xp.shape(0);
-    auto idx = nbr_idx.unchecked<1>();
-    auto ptr = row_ptr.unchecked<1>();
-
-    if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
-    
-    // Initialize a sparse matrix
-    Eigen::SparseMatrix<double> result(n, n);
-
-    // double rc = self.get_cutoff();
-    // std::cout<<"rc in kernel_interface value_sparse: "<<rc<<std::endl;
-
-    // Use lists to store row, column and value for sparse representation
-    std::vector<Eigen::Triplet<double>> tripletList; // For holding non-zero elements
-    
-    for (size_t i = 0; i < n; ++i) {
-        // Calculate the covariance for the points in the neighborhood
-        double self_value = self.value(&(xp(i, 0)), &(xp(i, 0)));
-        tripletList.emplace_back(i, i, self_value); // Diagonal element
-
-        size_t start = ptr[i];
-        size_t end   = ptr[i + 1];
-
-        for (size_t k = start; k < end; ++k) {
-            size_t j = idx[k];
-            if (i < j) { // Only compute for upper triangle
-                double value = self.value(&(xp(i, 0)), &(xp(j, 0)));
-                tripletList.emplace_back(i, j, value);
-                tripletList.emplace_back(j, i, value); // Symmetric entry
-            }
-        }
-    }
-    
-    result.setFromTriplets(tripletList.begin(), tripletList.end()); // Construct sparse matrix from triplet list
-
-    return result; // Make sure this returns a format compatible with Python (e.g., via PyEigen)
-});
-
-
-
 
 
 
@@ -184,53 +143,98 @@ interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, p
   });
 
 
-  interface.def("gradient_sparse", [](KernelInterface& self, py::array_t<unsigned> which, py::array_t<double> x, py::array_t<int64_t> nbr_idx, py::array_t<int64_t> row_ptr) {
-      auto xp = x.unchecked<2>();
-      auto idx = nbr_idx.unchecked<1>();
-      auto ptr = row_ptr.unchecked<1>();
-
-      size_t n = xp.shape(0);
-      size_t size = self.size();
-      if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
-      
-      // Initialize a sparse matrix for each gradient output
-      std::vector<Eigen::SparseMatrix<double>> result(size, Eigen::SparseMatrix<double>(n, n));
-
-      // Initialize triplet list for storing non-zero elements
-      std::vector<std::vector<Eigen::Triplet<double>>> tripletList(size);  // Size initialized
-
-      auto w = which.unchecked<1>();
-      unsigned* wp = (unsigned*)&(w(0));
-      std::vector<double> grad_vector(size);
-
-      for (size_t i = 0; i < n; ++i) {
-          // Calculate the covariance for the points in the neighborhood
-          self.gradient(&(xp(i, 0)), &(xp(i, 0)), wp, grad_vector.data());
-          for (size_t k = 0; k < size; ++k) {
-              tripletList[k].emplace_back(i, i, grad_vector[k]); // Diagonal element
-          }
-
-          size_t start = ptr[i];
-          size_t end   = ptr[i + 1];
-
-          for (size_t g = start; g < end; ++g) {
-              size_t j = idx[g];
-              if (i < j) { // Only compute for upper triangle
-                  self.gradient(&(xp(i, 0)), &(xp(j, 0)), wp, grad_vector.data());
-                  for (size_t k = 0; k < size; ++k) {
-                      tripletList[k].emplace_back(i, j, grad_vector[k]);
-                      tripletList[k].emplace_back(j, i, grad_vector[k]); // Symmetric entry
-                  } 
-              }
-          }
+  // Sparsity pattern of the (symmetric) covariance matrix of a compactly supported kernel: the diagonal and
+  // the candidate neighbours (nbr_idx, row_ptr: CSR, e.g. from BallTree.query_radius with a radius >= the
+  // cutoff) whose Euclidean distance is <= radius, sorted in each row. Returns (indices, indptr), which
+  // are both the CSR and the CSC arrays of the symmetric matrix.
+  interface.def("sparse_pattern", [](KernelInterface& self, py::array_t<double> x, py::array_t<int64_t> nbr_idx, py::array_t<int64_t> row_ptr, double radius) {
+    auto xp = x.unchecked<2>();
+    auto idx = nbr_idx.unchecked<1>();
+    auto ptr = row_ptr.unchecked<1>();
+    const py::ssize_t n = xp.shape(0), ndim = xp.shape(1);
+    const double r2max = radius * radius;
+    auto within = [&](py::ssize_t i, int64_t j) {
+      double r2 = 0;
+      for (py::ssize_t d = 0; d < ndim; ++d) r2 += (xp(i, d) - xp(j, d)) * (xp(i, d) - xp(j, d));
+      return j != i && r2 <= r2max;
+    };
+    py::array_t<int64_t> indptr(n + 1);
+    auto ip = indptr.mutable_unchecked<1>();
+    std::vector<int64_t> counts(n);
+    {
+      py::gil_scoped_release release;
+      #pragma omp parallel for schedule(dynamic, 4096)
+      for (py::ssize_t i = 0; i < n; ++i) {
+        int64_t c = 1; // the diagonal
+        for (int64_t k = ptr(i); k < ptr(i + 1); ++k) if (within(i, idx(k))) ++c;
+        counts[i] = c;
       }
-
-      // Construct sparse matrix from triplet list
-      for (size_t k = 0; k < size; ++k) {
-          result[k].setFromTriplets(tripletList[k].begin(), tripletList[k].end());
+    }
+    ip(0) = 0;
+    for (py::ssize_t i = 0; i < n; ++i) ip(i + 1) = ip(i) + counts[i];
+    py::array_t<int32_t> indices(ip(n));
+    auto ind = indices.mutable_unchecked<1>();
+    {
+      py::gil_scoped_release release;
+      #pragma omp parallel for schedule(dynamic, 4096)
+      for (py::ssize_t i = 0; i < n; ++i) {
+        int64_t pos = ip(i);
+        ind(pos++) = int32_t(i);
+        for (int64_t k = ptr(i); k < ptr(i + 1); ++k) if (within(i, idx(k))) ind(pos++) = int32_t(idx(k));
+        std::sort(&ind(ip(i)), &ind(ip(i)) + (ip(i + 1) - ip(i)));
       }
+    }
+    return py::make_tuple(indices, indptr);
+  });
 
-      return result; // Return vector of sparse matrices
+  // Values of the kernel matrix at the entries of a sparsity pattern (see sparse_pattern), in its order.
+  interface.def("value_sparse", [](KernelInterface& self, py::array_t<double> x, py::array_t<int32_t> indices, py::array_t<int64_t> indptr) {
+    auto xp = x.unchecked<2>();
+    auto ind = indices.unchecked<1>();
+    auto ip = indptr.unchecked<1>();
+    if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
+    const py::ssize_t n = ip.shape(0) - 1;
+    py::array_t<double> values(ind.shape(0));
+    auto v = values.mutable_unchecked<1>();
+    {
+      py::gil_scoped_release release;
+      #pragma omp parallel for schedule(dynamic, 4096)
+      for (py::ssize_t i = 0; i < n; ++i) {
+        for (int64_t k = ip(i); k < ip(i + 1); ++k) v(k) = self.value(&(xp(i, 0)), &(xp(ind(k), 0)));
+      }
+    }
+    return values;
+  });
+
+  // Gradients of the kernel matrix with respect to the parameters at the entries of a sparsity pattern
+  // (see sparse_pattern): an array (number of parameters, number of entries).
+  interface.def("gradient_sparse", [](KernelInterface& self, py::array_t<unsigned> which, py::array_t<double> x, py::array_t<int32_t> indices, py::array_t<int64_t> indptr) {
+    auto xp = x.unchecked<2>();
+    auto ind = indices.unchecked<1>();
+    auto ip = indptr.unchecked<1>();
+    if (xp.shape(1) != py::ssize_t(self.ndim())) throw george::dimension_mismatch();
+    const py::ssize_t n = ip.shape(0) - 1, nnz = ind.shape(0);
+    const size_t size = self.size();
+    auto w = which.unchecked<1>();
+    const unsigned* wp = (const unsigned*)&(w(0));
+    py::array_t<double> result({py::ssize_t(size), nnz});
+    auto g = result.mutable_unchecked<2>();
+    {
+      py::gil_scoped_release release;
+      #pragma omp parallel
+      {
+        std::vector<double> grad(size);
+        #pragma omp for schedule(dynamic, 4096)
+        for (py::ssize_t i = 0; i < n; ++i) {
+          for (int64_t k = ip(i); k < ip(i + 1); ++k) {
+            std::fill(grad.begin(), grad.end(), 0.0);
+            self.gradient(&(xp(i, 0)), &(xp(ind(k), 0)), wp, grad.data());
+            for (size_t p = 0; p < size; ++p) g(p, k) = grad[p];
+          }
+        }
+      }
+    }
+    return result;
   });
 
 
