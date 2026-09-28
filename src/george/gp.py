@@ -447,12 +447,12 @@ class GP(ModelSet):
         n_mean = 0
         nvec = 10
 
-        # Sparse (SuperLU) solver: Hutchinson trace estimates tr(K^-1 dK) ~ mean_i z_i^T dK u_i with
+        # Sparse (SuperLU) and butterflypack solvers: Hutchinson trace estimates tr(K^-1 dK) ~ mean_i z_i^T dK u_i with
         # z_i = K^-1 u_i. The same probes u_i are used in every call so the estimated gradient is a
         # deterministic, smooth function of the parameters (L-BFGS line searches need that), and
         # the z_i come from one multi-RHS solve shared by all parameters.
-        sparse_probes = (self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==1
-                         and self.solver_kwargs['model_bpack']==0 and self.solver_kwargs['debug']==0)
+        sparse_probes = (self.solver_type is not HODLRSolver and (self.solver_kwargs['model_sparse']==1
+                         or self.solver_kwargs['model_bpack']==1) and self.solver_kwargs['debug']==0)
         if sparse_probes:
             U = np.random.default_rng(0).choice([-1.0, 1.0], size=(alpha.shape[0], self.solver.nprobe))
             Z = self.solver.apply_inverse(U, in_place=False).reshape(U.shape)
@@ -585,12 +585,12 @@ class GP(ModelSet):
         Fisher information matrix of the log-likelihood (the expected negative Hessian) with respect to
         the parameters returned by :func:`GP.get_parameter_vector`:
         F_ij = 0.5 tr(K^-1 dK/dtheta_i K^-1 dK/dtheta_j). Only implemented for the sparse (SuperLU)
-        solver, where the traces are estimated with the same fixed probes u_k as the gradient:
+        and butterflypack solvers, where the traces are estimated with the same fixed probes u_k as the gradient:
         F_ij ~ 0.5 mean_k (dK_i K^-1 u_k)^T (K^-1 dK_j u_k), which takes 1 + len(self) multi-RHS
         solves. You must call :func:`GP.compute` before this function.
         """
-        if not (self.solver_type is not HODLRSolver and self.solver_kwargs['model_sparse']==1 and self.solver_kwargs['model_bpack']==0):
-            raise NotImplementedError("fisher_information is only implemented for the sparse solver")
+        if not (self.solver_type is not HODLRSolver and (self.solver_kwargs['model_sparse']==1 or self.solver_kwargs['model_bpack']==1)):
+            raise NotImplementedError("fisher_information is only implemented for the sparse and butterflypack solvers")
         if len(self.mean):
             raise NotImplementedError("fisher_information does not support fitted mean parameters")
         if not self.recompute(quiet=quiet):

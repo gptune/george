@@ -86,6 +86,11 @@ def test_general_metric(seed=1234, N=2, ndim=3):
     _general_metric(metric, N=N, ndim=ndim)
 
 
+def test_isotropic_metric_repr(ndim=3):
+    kernel = 0.1 * kernels.ExpSquaredKernel(0.49, ndim=ndim)
+    assert "Metric(0.49" in repr(kernel)
+
+
 def test_axis_algined_metric(seed=1234, N=100, ndim=3):
     np.random.seed(seed)
 
