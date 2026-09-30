@@ -428,9 +428,25 @@ class GP(ModelSet):
         if not self.recompute(quiet=quiet):
             return np.zeros(len(self), dtype=np.float64)
 
+        # Sparse (SuperLU) and butterflypack solvers: Hutchinson trace estimates tr(K^-1 dK) ~ mean_i z_i^T dK u_i with
+        # z_i = K^-1 u_i. The same probes u_i are used in every call so the estimated gradient is a
+        # deterministic, smooth function of the parameters (L-BFGS line searches need that), and
+        # the z_i come from one multi-RHS solve shared by all parameters.
+        sparse_probes = (self.solver_type is not HODLRSolver and (self.solver_kwargs['model_sparse']==1
+                         or self.solver_kwargs['model_bpack']==1) and self.solver_kwargs['debug']==0)
+        # butterflypack: alpha comes from the same multi-RHS solve as the z_i, and each dK/dtheta is applied
+        # to alpha and the probes in one multiply (every solve and multiply is a call to the butterflypack workers)
+        bpack_batched = sparse_probes and self.solver_kwargs['model_bpack']==1
+
         # Pre-compute some factors.
         try:
-            alpha = self._compute_alpha(y, False)
+            if bpack_batched:
+                r = np.ascontiguousarray(self._check_dimensions(y) - self._call_mean(self._x), dtype=np.float64)
+                U = np.random.default_rng(0).choice([-1.0, 1.0], size=(r.shape[0], self.solver.nprobe))
+                X = np.asarray(self.solver.apply_inverse(np.column_stack([r, U]), in_place=False)).reshape(r.shape[0], -1)
+                alpha, Z = X[:, 0].copy(), X[:, 1:]
+            else:
+                alpha = self._compute_alpha(y, False)
         except ValueError:
             if quiet:
                 return np.zeros(len(self), dtype=np.float64)
@@ -447,13 +463,7 @@ class GP(ModelSet):
         n_mean = 0
         nvec = 10
 
-        # Sparse (SuperLU) and butterflypack solvers: Hutchinson trace estimates tr(K^-1 dK) ~ mean_i z_i^T dK u_i with
-        # z_i = K^-1 u_i. The same probes u_i are used in every call so the estimated gradient is a
-        # deterministic, smooth function of the parameters (L-BFGS line searches need that), and
-        # the z_i come from one multi-RHS solve shared by all parameters.
-        sparse_probes = (self.solver_type is not HODLRSolver and (self.solver_kwargs['model_sparse']==1
-                         or self.solver_kwargs['model_bpack']==1) and self.solver_kwargs['debug']==0)
-        if sparse_probes:
+        if sparse_probes and not bpack_batched:
             U = np.random.default_rng(0).choice([-1.0, 1.0], size=(alpha.shape[0], self.solver.nprobe))
             Z = self.solver.apply_inverse(U, in_place=False).reshape(U.shape)
 
@@ -518,18 +528,25 @@ class GP(ModelSet):
 
             else:
                 alpha_term = np.zeros(l)
-                for k in range(l):
-                    y = self.solver.apply_forward(alpha,k+1)
-                    alpha_term[k] = 0.5 * np.dot(np.ravel(y), np.ravel(alpha))
-
                 trace_estimates = np.zeros(l)
+                if(bpack_batched):
+                    for k in range(l):
+                        Y = np.asarray(self.solver.apply_forward(np.column_stack([alpha, U]), k+1)).reshape(alpha.shape[0], -1)
+                        alpha_term[k] = 0.5 * np.dot(Y[:, 0], alpha)
+                        trace_estimates[k] = 0.5*np.mean(np.sum(Y[:, 1:]*Z, axis=0))
+                else:
+                    for k in range(l):
+                        y = self.solver.apply_forward(alpha,k+1)
+                        alpha_term[k] = 0.5 * np.dot(np.ravel(y), np.ravel(alpha))
 
                 if(self.solver_kwargs['debug']==1):
                     Kg = self.kernel.get_gradient(self._x)
                     K = self.solver.get_full(0)
                     L = np.linalg.cholesky(K)
 
-                if(sparse_probes):
+                if(bpack_batched):
+                    pass  # with the alpha terms above
+                elif(sparse_probes):
                     for k in range(l):
                         trace_estimates[k] = 0.5*np.mean(np.sum(self.solver.apply_forward(U, k+1)*Z, axis=0))
                 else:

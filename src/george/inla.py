@@ -7,13 +7,17 @@ that covers the inputs, extended on each side by a buffer whose cells grow geome
 is solved with Neumann boundary conditions, which inflate the variance within about one range of
 the boundary). Its precision matrix
 
-    Q = tau^2 L C^-1 L,    L = C + sum_d Lambda_d G_d,
+    Q = tau^2 C p(S),    S = C^-1 sum_d Lambda_d G_d,
 
-discretizes (1 - div Lambda grad)(tau x) = W (alpha = 2), the stationary solution of which is a
-Matern field with smoothness nu = 2 - d/2 (nu = 1 in 2D, nu = 1/2 in 3D), marginal variance sigma^2
-and length scale l_d = sqrt(2 nu Lambda_d) along dimension d (correlation M_nu(sqrt(2 nu) r),
-r = |(s - s') / l|). C (diagonal) and G_d are the lumped mass matrix and the stiffness matrix of
-dimension d of the multilinear finite elements on the lattice.
+discretizes (1 - div Lambda grad)^(alpha/2) (tau x) = W, the stationary solution of which is a Matern
+field with smoothness nu = alpha - d/2, marginal variance sigma^2 and length scale
+l_d = sqrt(2 nu Lambda_d) along dimension d (correlation M_nu(sqrt(2 nu) r), r = |(s - s') / l|).
+C (diagonal) and G_d are the lumped mass matrix and the stiffness matrix of dimension d of the
+multilinear finite elements on the lattice. For an integer alpha, p(s) = (1 + s)^alpha (alpha = 2:
+Q = tau^2 L C^-1 L with L = C + sum_d Lambda_d G_d); otherwise p is the polynomial of degree
+ceil(alpha) of the "parsimonious" approximation of R-INLA (Lindgren et al. 2011), which minimizes a
+weighted L2 error of the spectral density. The default is alpha = 2 (nu = 1 in 2D, nu = 1/2 in 3D).
+tau^2 is set so that the marginal variance of the field of spectral density 1 / p is sigma^2.
 
 The observations are y = mean + A x + e, e ~ N(0, s^2 I), A interpolating multilinearly from the
 lattice nodes (a selection matrix for inputs on the nodes), and mean is the sample mean of y. With
@@ -29,7 +33,7 @@ symbolic factorization.
 
 The predictive mean is A_* Q_c^-1 b + mean. The predictive variances (of the latent function, without
 the noise) come from nsamples samples x_s ~ N(0, Q_c^-1) of the posterior of x, drawn by solving
-Q_c x_s = w_s with w_s = tau L C^-1/2 z1 + A' z2 / s ~ N(0, Q_c). For every lattice cell, the
+Q_c x_s = w_s with w_s = tau C V p^1/2 z1 + A' z2 / s ~ N(0, Q_c) (V below). For every lattice cell, the
 covariance block of its 2^d nodes is estimated with the Rao-Blackwellized estimator
 
     Sigma_BB = Q_BB^-1 + mean_s z_s z_s',   z_s = Q_BB^-1 (Q_c x_s)_B - (x_s)_B = -E[x_B | x_-B],
@@ -41,8 +45,9 @@ The gradient of the log-likelihood is exact except for two traces of matrices of
 observations, tr(A Q_c^-1 A') and tr((Q^-1 - Q_c^-1) dQ) = w tr(A Q_c^-1 dQ Q^-1 A') (the part of
 tr(Q_c^-1 dQ) not cancelled by the derivative of log|Q|), Hutchinson estimates with fixed probes from
 one multi-RHS solve, exact if there are fewer observations than probes. The Fisher information (for
-the MALA sampler) is estimated in the same way. Q^-1 is applied with the eigenvectors of the 1D
-matrices, Q^-1 = tau^-2 V diag(eigenvalues of C^-1 L)^-2 V', V = kron(V_d).
+the MALA sampler) is estimated in the same way. Q^-1 is applied with the M_d-orthonormal generalized
+eigenvectors V_d of the 1D matrices (G_d V_d = M_d V_d mu_d): Q^-1 = tau^-2 V diag(1 / p(s)) V',
+V = kron(V_d), s = sum_d Lambda_d mu_d, and log|Q| = n log tau^2 + log|C| + sum log p(s).
 """
 
 from __future__ import division, print_function
@@ -51,8 +56,10 @@ __all__ = ["INLAGP"]
 
 import itertools
 import time
+from math import comb, factorial
 
 import numpy as np
+from scipy.integrate import quad
 from scipy.linalg import eigh_tridiagonal
 from scipy.sparse import coo_matrix, csc_matrix, diags, identity, kron
 from scipy.special import gamma as gamma_function
@@ -136,6 +143,34 @@ def _kron(factors):
     return out
 
 
+def _smoothness_polynomial(alpha):
+    """
+    The coefficients c_0, ..., c_m (m = ceil(alpha)) of p(s) = sum_j c_j s^j approximating the spectral
+    function (1 + s)^alpha of the SPDE: exact for an integer alpha, otherwise the "parsimonious"
+    approximation of R-INLA (inla.spde2.matern, for 0 < alpha < 2) generalized to any alpha:
+    p(s) = sum_i a_i (1 + s)^i where, with t = 1 / (1 + s), q(t) = sum_i a_i t^(m-i) is the least-squares
+    approximation of t^(m-alpha) on [0, 1] with the weight t^(lambda-1), lambda = alpha - floor(alpha).
+    """
+    m = int(np.ceil(alpha - 1e-12))
+    if abs(alpha - round(alpha)) < 1e-12:
+        return np.array([comb(m, j) for j in range(m + 1)], dtype=float)
+    lam = alpha - np.floor(alpha)
+    i = np.arange(m + 1)
+    a = np.linalg.solve(1.0 / (2 * m - i[:, None] - i[None, :] + lam), 1.0 / (2 * m - i + lam - alpha))
+    return np.array([sum(a[k] * comb(k, j) for k in range(j, m + 1)) for j in range(m + 1)])
+
+
+def _variance_integral(coefficients, alpha, ndim):
+    """
+    int_0^inf s^(d/2-1) / p(s) ds, with which the marginal variance of the field of spectral density
+    1 / p(|w|^2) is 1 / ((4 pi)^(d/2) Gamma(d/2) tau^2 sqrt(det Lambda)) times it.
+    """
+    if abs(alpha - round(alpha)) < 1e-12:
+        return gamma_function(ndim / 2.0) * gamma_function(alpha - ndim / 2.0) / gamma_function(alpha)
+    value, _ = quad(lambda s: s ** (ndim / 2.0 - 1) / np.polynomial.polynomial.polyval(s, coefficients), 0, np.inf, limit=200)
+    return value
+
+
 class INLAGP(object):
     """
     A Gaussian process with the INLA/SPDE Matern model on a tensor-product lattice, with the parts of
@@ -144,6 +179,8 @@ class INLAGP(object):
 
     Args:
         ndim (int): 2 or 3.
+        nu (None or float): the smoothness nu > 0 of the Matern field (exact if nu + ndim/2 is an
+            integer, approximated otherwise); None for alpha = 2 (nu = 2 - ndim/2).
         noise_variance, amplitude (float): the initial s^2 and sigma^2.
         lengthscale (float or array): the initial length scale(s).
         isotropic (bool): one length scale for all the dimensions.
@@ -166,11 +203,18 @@ class INLAGP(object):
 
     def __init__(self, ndim, noise_variance=1e-6, amplitude=1.0, lengthscale=0.1, isotropic=False,
                  shape=None, bounds=None, buffer=0.5, buffer_ratio=1.2, nsamples=128, batch=32,
-                 rb_ring=1, nprobe=64, seed=0, verbose=0, INT64=0, algo3d=0):
+                 rb_ring=1, nprobe=64, seed=0, verbose=0, INT64=0, algo3d=0, nu=None):
         if ndim not in (2, 3):
             raise ValueError("INLA supports only 2D and 3D inputs, got %d dimensions" % ndim)
         self.ndim = ndim
-        self.nu = 2.0 - ndim / 2.0
+        self.nu = 2.0 - ndim / 2.0 if nu is None else float(nu)
+        if self.nu <= 0:
+            raise ValueError("INLA: the smoothness nu must be positive, got %g" % self.nu)
+        self.alpha = self.nu + ndim / 2.0
+        # p(s) and the constant of tau^2 = constant / (sigma^2 sqrt(det Lambda))
+        self._polynomial = _smoothness_polynomial(self.alpha)
+        self._tau2_constant = (_variance_integral(self._polynomial, self.alpha, ndim)
+                               / ((4 * np.pi) ** (ndim / 2.0) * gamma_function(ndim / 2.0)))
         self.isotropic = bool(isotropic)
         nlength = 1 if self.isotropic else ndim
         lengthscale = np.broadcast_to(np.asarray(lengthscale, dtype=float), (nlength,))
@@ -214,7 +258,7 @@ class INLAGP(object):
         sigma2 = np.exp(p[1])
         lengthscale2 = np.broadcast_to(np.exp(p[2:]), (self.ndim,))
         lam = lengthscale2 / (2 * self.nu)
-        tau2 = gamma_function(self.nu) / ((4 * np.pi) ** (self.ndim / 2.0) * sigma2 * np.sqrt(np.prod(lam)))
+        tau2 = self._tau2_constant / (sigma2 * np.sqrt(np.prod(lam)))
         return s2, sigma2, tau2, lam
 
     @property
@@ -269,16 +313,20 @@ class INLAGP(object):
                              shape=(x.shape[0], n)).tocsr()
 
         # 1D matrices, their generalized eigenvalues mu and M-orthonormal eigenvectors V (G V = M V mu,
-        # V' M V = I), for log|Q| and Q^-1 = tau^-2 V (1 + sum_d Lambda_d mu_d)^-2 V' with V = kron(V_d),
-        # and the tensor-product matrices
-        masses, stiffs, masses_sp = [], [], []
+        # V' M V = I), for log|Q| and Q^-1 = tau^-2 V diag(1 / p(sum_d Lambda_d mu_d)) V' with V = kron(V_d),
+        # and B_j = M (M^-1 G)^j, j = 0, ..., m (B_0 = M, B_1 = G, B_2 = G M^-1 G, ...)
+        order = len(self._polynomial) - 1
+        masses, powers = [], []
         self._eigenvalues = []
         self._eigenvectors = []
         for z in self._nodes:
             mass, stiff_diag, stiff_off = _fem_1d(z)
+            stiff = diags([stiff_off, stiff_diag, stiff_off], [-1, 0, 1], format="csr")
             masses.append(mass)
-            masses_sp.append(diags(mass))
-            stiffs.append(diags([stiff_off, stiff_diag, stiff_off], [-1, 0, 1]))
+            B = [diags(mass, format="csr")]
+            for _ in range(order):
+                B.append((stiff @ diags(1 / mass) @ B[-1]).tocsr())
+            powers.append(B)
             scaled_off = stiff_off / np.sqrt(mass[:-1] * mass[1:])
             eig, vectors = eigh_tridiagonal(stiff_diag / mass, scaled_off)
             self._eigenvalues.append(np.maximum(eig, 0.0))
@@ -286,17 +334,11 @@ class INLAGP(object):
         self._cdiag = _kron([diags(m) for m in masses]).diagonal()
         self._logdet_c = sum(np.sum(np.log(masses[k])) * n / self._shape[k] for k in range(d))
 
-        def tensor(replace):
-            return _kron([replace.get(k, masses_sp[k]) for k in range(d)])
-
-        # Q / tau^2 = C + sum_d 2 Lambda_d G_d + sum_d Lambda_d^2 G_d C^-1 G_d + sum_{d<e} 2 Lambda_d Lambda_e G_d C^-1 G_e
-        self._stiff = [tensor({k: stiffs[k]}) for k in range(d)]
-        terms = [("c", diags(self._cdiag, format="csr"))]
-        terms += [(("g", k), self._stiff[k]) for k in range(d)]
-        for k in range(d):
-            terms.append((("gg", k, k), tensor({k: stiffs[k] @ diags(1 / masses[k]) @ stiffs[k]})))
-            for l in range(k + 1, d):
-                terms.append((("gg", k, l), tensor({k: stiffs[k], l: stiffs[l]})))
+        # Q / tau^2 = C p(S) = sum_j c_j C (sum_d Lambda_d S_d)^j, S_d = C^-1 G_d acting on dimension d: the
+        # term of a multi-index k (|k| <= m) is kron_d(B_{k_d}) with the coefficient
+        # c_|k| multinomial(|k|; k) prod_d Lambda_d^k_d
+        self._multi_indices = [k for k in itertools.product(range(order + 1), repeat=d) if sum(k) <= order]
+        terms = [(("k", k), _kron([powers[dim][k[dim]] for dim in range(d)])) for k in self._multi_indices]
         self._AtA = (self._A.T @ self._A).tocsr()
         terms.append(("data", self._AtA))
 
@@ -372,12 +414,11 @@ class INLAGP(object):
         return csc_matrix((data, self._indices, self._indptr), shape=(self._n, self._n))
 
     def _prior_coefficients(self, tau2, lam):
-        """The coefficients of the terms of Q = tau^2 L C^-1 L."""
-        coefficients = {"c": tau2}
-        for k in range(self.ndim):
-            coefficients[("g", k)] = 2 * tau2 * lam[k]
-            for l in range(k, self.ndim):
-                coefficients[("gg", k, l)] = tau2 * lam[k] * lam[l] * (1 if k == l else 2)
+        """The coefficients of the terms of Q = tau^2 C p(S)."""
+        coefficients = {}
+        for k in self._multi_indices:
+            multinomial = factorial(sum(k)) / np.prod([factorial(kd) for kd in k])
+            coefficients[("k", k)] = tau2 * self._polynomial[sum(k)] * multinomial * np.prod(lam ** np.array(k))
         return coefficients
 
     def _assemble(self, params=None, data_term=True):
@@ -388,36 +429,46 @@ class INLAGP(object):
             coefficients["data"] = 1 / s2
         return self._combine(coefficients)
 
-    def _eigen_terms(self, lam):
-        """Lambda_d mu_d along the dimension d of the lattice, for every d (broadcastable to its shape)."""
-        terms = []
+    def _spectrum(self, lam):
+        """p(s) at the eigenvalues s = sum_d Lambda_d mu_d of S (array of the shape of the lattice)."""
+        s = 0.0
         for k in range(self.ndim):
             axis_shape = [1] * self.ndim
             axis_shape[k] = -1
-            terms.append(lam[k] * self._eigenvalues[k].reshape(axis_shape))
-        return terms
+            s = s + lam[k] * self._eigenvalues[k].reshape(axis_shape)
+        return np.polynomial.polynomial.polyval(s, self._polynomial)
 
     def logdet_prior(self, params=None):
-        """log|Q|, from the eigenvalues of C^-1 L = I + sum_d Lambda_d C^-1 G_d."""
+        """log|Q| = n log tau^2 + log|C| + sum log p(s), s the eigenvalues of S."""
         _, _, tau2, lam = self._hyperparameters(params)
-        eig = 1.0 + sum(self._eigen_terms(lam))
-        return self._n * np.log(tau2) + self._logdet_c + 2 * np.sum(np.log(eig))
+        return self._n * np.log(tau2) + self._logdet_c + np.sum(np.log(self._spectrum(lam)))
 
-    def _prior_solve(self, rhs):
-        """Q^-1 rhs (rhs of shape (n,) or (n, ncol)), with the eigenvectors of the 1D matrices."""
+    def _eigenvector_apply(self, x, transpose):
+        """kron(V_d) x (or its transpose), x of the shape of the lattice with trailing columns."""
+        for k, vectors in enumerate(self._eigenvectors):
+            x = np.moveaxis(np.tensordot(vectors.T if transpose else vectors, x, axes=(1, k)), 0, k)
+        return x
+
+    def _spectral_apply(self, rhs, power, transposed_first):
+        """V diag(p^power) V' rhs, or V diag(p^power) rhs if not transposed_first, rhs of shape (n,) or (n, ncol)."""
         _, _, tau2, lam = self._hyperparameters()
-        eig = 1.0 + sum(self._eigen_terms(lam))
+        spectrum = self._spectrum(lam) ** power
         rhs = np.asarray(rhs, dtype=float)
         x = rhs.reshape(self._shape + rhs.shape[1:])
+        if transposed_first:
+            x = self._eigenvector_apply(x, True)
+        x = x * spectrum.reshape(spectrum.shape + (1,) * (x.ndim - self.ndim))
+        return self._eigenvector_apply(x, False).reshape(rhs.shape), tau2
 
-        def apply(x, transpose):
-            for k, vectors in enumerate(self._eigenvectors):
-                x = np.moveaxis(np.tensordot(vectors.T if transpose else vectors, x, axes=(1, k)), 0, k)
-            return x
+    def _prior_solve(self, rhs):
+        """Q^-1 rhs = tau^-2 V diag(1 / p) V' rhs (rhs of shape (n,) or (n, ncol))."""
+        x, tau2 = self._spectral_apply(rhs, -1.0, True)
+        return x / tau2
 
-        x = apply(x, True)
-        x = x / (eig ** 2).reshape(eig.shape + (1,) * (x.ndim - self.ndim))
-        return apply(x, False).reshape(rhs.shape) / tau2
+    def _prior_sqrt(self, z):
+        """F z with F F' = Q: F = tau C V diag(p^1/2), as Q = tau^2 C V diag(p) V' C."""
+        x, tau2 = self._spectral_apply(z, 0.5, False)
+        return np.sqrt(tau2) * self._cdiag.reshape((-1,) + (1,) * (x.ndim - 1)) * x
 
     def _precision_derivatives(self):
         """
@@ -429,14 +480,11 @@ class INLAGP(object):
         prior = self._prior_coefficients(tau2, lam)
         # tau^2 is proportional to 1 / sigma^2
         derivatives = [self._combine({name: -coef for name, coef in prior.items()})]
-        # log l_k^2 = log Lambda_k + const, tau^2 is proportional to prod_k Lambda_k^-1/2
+        # log l_d^2 = log Lambda_d + const: the coefficient of a term of multi-index k is proportional to
+        # tau^2 prod_d Lambda_d^k_d, and tau^2 to prod_d Lambda_d^-1/2
         for group in ([list(range(d))] if self.isotropic else [[k] for k in range(d)]):
-            coefficients = {name: -0.5 * len(group) * coef for name, coef in prior.items()}
-            for k in group:
-                coefficients[("g", k)] += 2 * tau2 * lam[k]
-                for l in range(d):
-                    coefficients[("gg", min(k, l), max(k, l))] += 2 * tau2 * lam[k] * lam[l]
-            derivatives.append(self._combine(coefficients))
+            derivatives.append(self._combine({name: coef * sum(name[1][dim] - 0.5 for dim in group)
+                                              for name, coef in prior.items()}))
         return derivatives
 
     @property
@@ -651,14 +699,12 @@ class INLAGP(object):
 
         # the samples, nsamples of N(0, Q_c^-1) by batches of batch solves with right-hand sides of N(0, Q_c)
         rng = np.random.default_rng(self.seed)
-        L = diags(self._cdiag) + sum(lam[k] * self._stiff[k] for k in range(d))
-        scale = np.sqrt(tau2) / np.sqrt(self._cdiag)
         exact = np.empty((ncell, ncorner, ncorner))
         second = np.zeros((ncell, ncorner, ncorner))
         done = 0
         while done < self.nsamples:
             nrhs = min(self.batch, self.nsamples - done)
-            rhs = L @ (scale[:, None] * rng.standard_normal((self._n, nrhs)))
+            rhs = self._prior_sqrt(rng.standard_normal((self._n, nrhs)))
             rhs += self._A.T @ rng.standard_normal((self._A.shape[0], nrhs)) / np.sqrt(s2)
             samples = np.asfortranarray(rhs)
             superlu_solve(samples, self.verbose == 1)

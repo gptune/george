@@ -10,6 +10,7 @@ from scipy.sparse.linalg import splu
 # from pdbridge import *
 from dPy_BPACK_wrapper import *
 from ..metrics import Metric
+from ..kernels import Product, ConstantKernel, ExpSquaredKernel
 import copy
 import scipy
 import time
@@ -56,10 +57,55 @@ class BasicSolver(object):
             "yerr": yerr.astype(np.float64),
             "id": gid
         }
+        geometry_scale = np.ones(x.shape[1])
         if self.bpack_scaled_geometry == 1:
-            meta["coordinates"] = np.ascontiguousarray(x * self._inverse_lengthscales(x.shape[1]), dtype=np.float64)
+            geometry_scale = self._inverse_lengthscales(x.shape[1])
+            meta["coordinates"] = np.ascontiguousarray(x * geometry_scale, dtype=np.float64)
             meta["kernel_coordinates"] = x
+        gpu_kernel = self._bpack_gpu_kernel(x.shape[1], yerr, gid, geometry_scale)
+        if gpu_kernel is not None:
+            meta["gpu_kernel"] = gpu_kernel
         return meta
+
+    def _bpack_gpu_kernel(self, ndim, yerr, gid, geometry_scale):
+        """
+        The device form of the kernel for the GPU backend of butterflypack's H2 format
+        (c_bpack_h2_set_gpu_kernel, kind 4): a constant times an axis-aligned or isotropic squared
+        exponential of the coordinates passed to butterflypack (the points times geometry_scale), for
+        gid = 0 with yerr^2 on the diagonal, else its derivative in parameter gid-1 of the kernel.
+        None if the kernel or yerr has no such form.
+        """
+        if ndim > 3:
+            return None
+        parts = [self.kernel.k1, self.kernel.k2] if isinstance(self.kernel, Product) else [self.kernel]
+        constants = [k for k in parts if isinstance(k, ConstantKernel)]
+        squared = [k for k in parts if isinstance(k, ExpSquaredKernel)]
+        if len(squared) != 1 or len(constants) + 1 != len(parts) or squared[0].block is not None:
+            return None
+        metric = squared[0].metric
+        if metric.metric_type == 2:
+            return None
+        inverse_metric = np.zeros(3)
+        for i, axis in enumerate(metric.axes):
+            inverse_metric[axis] = 1.0 / (np.diag(metric.to_matrix())[i] * geometry_scale[axis]**2)
+        diagonal = 0.0
+        if gid == 0:
+            yerr2 = np.atleast_1d(yerr)**2
+            if np.ptp(yerr2) > 0:
+                return None
+            diagonal = float(yerr2[0])
+            mode = 0
+        else:
+            name = self.kernel.get_parameter_names(include_frozen=True)[gid-1]
+            if name.endswith("log_constant"):
+                mode = 1
+            elif ":log_M_" in name:
+                mode = 5 if metric.metric_type == 0 else 2 + metric.axes[int(name.split("_")[-1])]
+            else:
+                return None
+        # (a ConstantKernel is ndim exp(log_constant): take its value)
+        amplitude = float(np.prod([k.get_value(np.zeros((1, k.ndim)))[0, 0] for k in constants]))
+        return {"kind": 4, "params": [amplitude, diagonal] + inverse_metric.tolist() + [mode]}
 
     def _inverse_lengthscales(self, ndim):
         metrics = []
