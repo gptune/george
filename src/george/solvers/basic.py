@@ -57,24 +57,51 @@ class BasicSolver(object):
             "yerr": yerr.astype(np.float64),
             "id": gid
         }
-        geometry_scale = np.ones(x.shape[1])
         if self.bpack_scaled_geometry == 1:
-            geometry_scale = self._inverse_lengthscales(x.shape[1])
-            meta["coordinates"] = np.ascontiguousarray(x * geometry_scale, dtype=np.float64)
+            meta["coordinates"] = np.ascontiguousarray(x * self._bpack_geometry_scale(x.shape[1]), dtype=np.float64)
             meta["kernel_coordinates"] = x
-        gpu_kernel = self._bpack_gpu_kernel(x.shape[1], yerr, gid, geometry_scale)
-        if gpu_kernel is not None:
-            meta["gpu_kernel"] = gpu_kernel
         return meta
 
-    def _bpack_gpu_kernel(self, ndim, yerr, gid, geometry_scale):
+    # The entry evaluator of the GPU backends (payload["gpu_entry"], registered by
+    # Py_BPACK_worker.py; doc/gpu_kernels.md): K or one of its hyperparameter derivatives,
+    # selected by params[1] (mode): with s_d the inverse squared length scales of the
+    # coordinates passed to butterflypack, t_d = s_d (x_d - y_d)^2, q = sum_d t_d and
+    # e = amplitude exp(-q/2),
+    #   mode 0: e, plus yerr_i^2 when i == j      (the kernel K)
+    #   mode 1: e                                 (d K / d log_constant)
+    #   mode 2+d: e t_d / 2                       (d K / d log_M_d, axis-aligned metrics)
+    #   mode 5: e q / 2                           (d K / d log_M, isotropic metrics)
+    _BPACK_GPU_ENTRY_SOURCE = r"""
+__device__ double bpack_entry(const double* x, long long i, const double* y, long long j,
+                              const double* params, int dim) {
+    const int mode = (int)params[1];
+    double q = 0.0;
+    for (int d = 0; d < dim; ++d) {
+        const double t = x[d] - y[d];
+        q += params[2 + d] * t * t;
+    }
+    double v = params[0] * exp(-0.5 * q);
+    if (mode == 0) {
+        if (i == j) v += params[2 + dim + i];
+        return v;
+    }
+    if (mode == 1) return v;
+    if (mode == 5) return 0.5 * v * q;
+    const double t = x[mode - 2] - y[mode - 2];
+    return 0.5 * v * params[mode] * t * t;
+}
+"""
+
+    def _bpack_gpu_entry(self, x, yerr, gid, geometry_scale):
         """
-        The device form of the kernel for the GPU backend of butterflypack's H2 format
-        (c_bpack_h2_set_gpu_kernel, kind 4): a constant times an axis-aligned or isotropic squared
-        exponential of the coordinates passed to butterflypack (the points times geometry_scale), for
-        gid = 0 with yerr^2 on the diagonal, else its derivative in parameter gid-1 of the kernel.
-        None if the kernel or yerr has no such form.
+        The GPU entry evaluator of the kernel for butterflypack's GPU backends, as CUDA source
+        text the library compiles with NVRTC (payload["gpu_entry"], doc/gpu_kernels.md): a
+        constant times an axis-aligned or isotropic squared exponential of the coordinates
+        passed to butterflypack (the points times geometry_scale), for gid = 0 with yerr^2 on
+        the diagonal, else its derivative in parameter gid-1 of the kernel. None if the kernel
+        has no such form.
         """
+        ndim = x.shape[1]
         if ndim > 3:
             return None
         parts = [self.kernel.k1, self.kernel.k2] if isinstance(self.kernel, Product) else [self.kernel]
@@ -85,15 +112,10 @@ class BasicSolver(object):
         metric = squared[0].metric
         if metric.metric_type == 2:
             return None
-        inverse_metric = np.zeros(3)
+        inverse_metric = np.zeros(ndim)
         for i, axis in enumerate(metric.axes):
             inverse_metric[axis] = 1.0 / (np.diag(metric.to_matrix())[i] * geometry_scale[axis]**2)
-        diagonal = 0.0
         if gid == 0:
-            yerr2 = np.atleast_1d(yerr)**2
-            if np.ptp(yerr2) > 0:
-                return None
-            diagonal = float(yerr2[0])
             mode = 0
         else:
             name = self.kernel.get_parameter_names(include_frozen=True)[gid-1]
@@ -105,7 +127,17 @@ class BasicSolver(object):
                 return None
         # (a ConstantKernel is ndim exp(log_constant): take its value)
         amplitude = float(np.prod([k.get_value(np.zeros((1, k.ndim)))[0, 0] for k in constants]))
-        return {"kind": 4, "params": [amplitude, diagonal] + inverse_metric.tolist() + [mode]}
+        params = [amplitude, float(mode)] + inverse_metric.tolist()
+        if mode == 0:
+            params = np.concatenate((params, np.atleast_1d(yerr).astype(np.float64)**2 * np.ones(x.shape[0])))
+        return {"source": self._BPACK_GPU_ENTRY_SOURCE, "params": params,
+                "flags": 3}  # BPACK_GPU_SYMMETRIC | BPACK_GPU_COORDINATES
+
+    def _bpack_geometry_scale(self, ndim):
+        """The per-dimension scaling of the coordinates passed to butterflypack (1 unless bpack_scaled_geometry)."""
+        if self.bpack_scaled_geometry == 1:
+            return self._inverse_lengthscales(ndim)
+        return np.ones(ndim)
 
     def _inverse_lengthscales(self, ndim):
         metrics = []
@@ -175,6 +207,9 @@ class BasicSolver(object):
                 "block_func_name": "compute_block",
                 "meta": meta
             }
+            gpu_entry = self._bpack_gpu_entry(x, yerr, 0, self._bpack_geometry_scale(x.shape[1]))
+            if gpu_entry is not None:
+                payload["gpu_entry"] = gpu_entry
             bpack_factor(payload, fid=0)
             end = time.time()
             if(self.verbose==1):
@@ -189,6 +224,9 @@ class BasicSolver(object):
                         "block_func_name": "compute_block",
                         "meta": meta
                     }
+                    gpu_entry = self._bpack_gpu_entry(x, yerr, g+1, self._bpack_geometry_scale(x.shape[1]))
+                    if gpu_entry is not None:
+                        payload["gpu_entry"] = gpu_entry
                     bpack_factor(payload, nofactor=True, fid=g+1)                    
                 end = time.time()
                 if(self.verbose==1):
@@ -257,14 +295,22 @@ class BasicSolver(object):
         Returns:
             float: The log-determinant value.
         """
+        # A hierarchical factorisation of a covariance matrix can come back indefinite at
+        # hyperparameters where the compression breaks down, which the sign of the determinant
+        # reports.  The log-determinant itself is legitimately negative (every eigenvalue of a
+        # covariance matrix with a small nugget is below one), so the sign is the only usable
+        # signal; it is recorded here so that a sampler can reject such a state.
+        self.log_determinant_sign = 1.0
         if self.model_bpack == 1:
             sign,logdet = bpack_logdet(fid=0)
+            self.log_determinant_sign = sign
             log_det = sign*logdet            
         else:    
             if self.model_sparse == 1:
                 # For sparse K, splu doesn't provide logdet. Use slogdet instead. 
                 # sign, logdet = np.linalg.slogdet(K.toarray())
                 sign,logdet = superlu_logdet(self.verbose)
+                self.log_determinant_sign = sign
                 log_det = sign*logdet
             else:
                 # For dense K

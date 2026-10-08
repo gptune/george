@@ -52,7 +52,7 @@ V = kron(V_d), s = sum_d Lambda_d mu_d, and log|Q| = n log tau^2 + log|C| + sum 
 
 from __future__ import division, print_function
 
-__all__ = ["INLAGP"]
+__all__ = ["INLAGP", "SphereINLAGP"]
 
 import itertools
 import time
@@ -341,9 +341,19 @@ class INLAGP(object):
         terms = [(("k", k), _kron([powers[dim][k[dim]] for dim in range(d)])) for k in self._multi_indices]
         self._AtA = (self._A.T @ self._A).tocsr()
         terms.append(("data", self._AtA))
+        self._set_terms(terms)
+        if self.verbose:
+            print("INLA lattice: %s nodes (%s without the %s buffer cells per side), %d nonzeros in Q_c, "
+                  "%.2f s" % ("x".join(map(str, self._shape)),
+                              "x".join(str(m - 2 * b) for m, b in zip(self._shape, self._buffer_cells)),
+                              "/".join(map(str, self._buffer_cells)), len(self._keys), time.time() - start))
 
-        # the common sparsity pattern (CSC with sorted indices, as factored), and the positions of
-        # the entries of every matrix in it
+    def _set_terms(self, terms):
+        """
+        Store the matrices (name, matrix) whose linear combinations are Q_c: their common sparsity
+        pattern (CSC with sorted indices, as factored) and the positions of their entries in it.
+        """
+        n = self._n
         pattern = identity(n, format="csc")
         for _, mat in terms:
             pattern = pattern + abs(mat)
@@ -363,11 +373,6 @@ class INLAGP(object):
         self._factor_id = None
         self._xhat = None
         self._blocks = None
-        if self.verbose:
-            print("INLA lattice: %s nodes (%s without the %s buffer cells per side), %d nonzeros in Q_c, "
-                  "%.2f s" % ("x".join(map(str, self._shape)),
-                              "x".join(str(m - 2 * b) for m, b in zip(self._shape, self._buffer_cells)),
-                              "/".join(map(str, self._buffer_cells)), len(self._keys), time.time() - start))
 
     def _positions(self, rows, cols):
         """The positions of the entries (rows, cols) in the pattern; -1 for the ones not in it."""
@@ -750,3 +755,494 @@ class INLAGP(object):
         rows = np.repeat(np.arange(t.shape[0]), weights.shape[1])
         At = coo_matrix((weights.ravel(), (rows, nodes.ravel())), shape=(t.shape[0], self._n)).tocsr()
         return mu, At @ self._solve(At.T.toarray())
+
+
+# ---------------------------------------------------------------------------------------- sphere
+
+def _icosphere(level):
+    """
+    The vertices (n, 3), on the unit sphere, and the triangles (nt, 3) of the icosahedron subdivided
+    level times (n = 10 4^level + 2, nt = 20 4^level).
+    """
+    phi = (1 + np.sqrt(5)) / 2
+    v = np.array([[-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+                  [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+                  [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]], dtype=float)
+    v /= np.linalg.norm(v, axis=1)[:, None]
+    t = np.array([[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+                  [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+                  [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+                  [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]])
+    for _ in range(level):
+        edges = np.sort(np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]]), axis=1)
+        unique, inverse = np.unique(edges, axis=0, return_inverse=True)
+        mid = v[unique[:, 0]] + v[unique[:, 1]]
+        mid /= np.linalg.norm(mid, axis=1)[:, None]
+        m = len(v) + np.ravel(inverse).reshape(3, -1)  # the midpoints of the edges 01, 12, 20
+        v = np.vstack([v, mid])
+        t = np.vstack([np.stack([t[:, 0], m[0], m[2]], axis=1), np.stack([t[:, 1], m[1], m[0]], axis=1),
+                       np.stack([t[:, 2], m[2], m[1]], axis=1), np.stack([m[0], m[1], m[2]], axis=1)])
+    return v, t
+
+
+def _fem_sphere(v, t):
+    """
+    The lumped mass (n,), the stiffness matrix (CSR) and the gradient operator B (CSR, 3 rows per
+    triangle: sqrt(area) grad phi_i, so that B'B is the stiffness matrix) of the linear finite elements
+    on the flat triangles t of the vertices v.
+    """
+    p = v[t]
+    e = np.stack([p[:, 2] - p[:, 1], p[:, 0] - p[:, 2], p[:, 1] - p[:, 0]], axis=1)  # edge opposite each vertex
+    normal = np.cross(e[:, 0], e[:, 1])
+    area2 = np.linalg.norm(normal, axis=1)  # twice the area
+    mass = np.bincount(t.ravel(), weights=np.repeat(area2 / 6, 3), minlength=len(v))
+    stiff_local = np.einsum("tid,tjd->tij", e, e) / (2 * area2)[:, None, None]  # e_i . e_j / (4 area)
+    rows = np.repeat(t, 3, axis=1).ravel()
+    cols = np.tile(t, (1, 3)).ravel()
+    stiff = coo_matrix((stiff_local.ravel(), (rows, cols)), shape=(len(v), len(v))).tocsr()
+    stiff.sum_duplicates()
+    # grad phi_i = (unit normal x e_i) / (2 area), times sqrt(area): rows 3 k + component, columns t[k, i]
+    grad = np.cross(normal[:, None, :], e) * (np.sqrt(area2 / 2) / area2 ** 2)[:, None, None]  # (nt, i, component)
+    nt = len(t)
+    brows = (3 * np.arange(nt)[:, None, None] + np.arange(3)[None, None, :]).repeat(3, axis=1).ravel()
+    bcols = np.repeat(t[:, :, None], 3, axis=2).ravel()
+    gradient = coo_matrix((grad.ravel(), (brows, bcols)), shape=(3 * nt, len(v))).tocsr()
+    return mass, stiff, gradient
+
+
+def _sphere_variance_sum(alpha, lam):
+    """
+    sum_{n >= 0} (2n + 1) / (4 pi (1 + lam n(n + 1))^alpha), and its derivative with respect to log lam:
+    tau^2 times the marginal variance of the field on the unit sphere whose precision is
+    tau^2 C (1 + lam C^-1 G)^alpha (the eigenvalues of the Laplace-Beltrami operator are n(n + 1), with
+    multiplicity 2n + 1). The sum is exact up to N and continued by the integral of its terms.
+    """
+    N = int(max(4000, 40 / np.sqrt(lam)))
+    n = np.arange(N + 1, dtype=float)
+    s = lam * n * (n + 1)
+    base = (1 + s) ** (-alpha)
+    total = np.sum((2 * n + 1) * base)
+    derivative = -alpha * np.sum((2 * n + 1) * s * base / (1 + s))
+    sN = lam * (N + 0.5) * (N + 1.5)
+    tail = (1 + sN) ** (1 - alpha) / (lam * (alpha - 1))
+    total += tail
+    derivative += -tail - sN * (1 + sN) ** (-alpha) / lam
+    return total / (4 * np.pi), derivative / (4 * np.pi)
+
+
+class SphereINLAGP(INLAGP):
+    """
+    INLAGP on the unit sphere: the Matern SPDE (1 - Lambda Delta_S)^(alpha/2) (tau x) = W, Delta_S the
+    Laplace-Beltrami operator, discretized with linear finite elements on the icosahedron subdivided
+    level times (10 4^level + 2 nodes), as the spherical meshes of R-INLA (Lindgren et al. 2011). The
+    inputs are 3D points on (or projected onto) the unit sphere, the single length scale is in chordal
+    units, and the smoothness nu = alpha - 1 must be a positive integer (nu = 1, 2 or 3: the fractional
+    approximation has no sparse square root for the samples). With L = C + Lambda G, C the lumped mass
+    and G the stiffness matrix,
+
+        Q = tau^2 L (C^-1 L)^(alpha - 1),    log|Q| = n log tau^2 + alpha log|L| - (alpha - 1) log|C|,
+
+    and tau^2 = sigma^-2 sum_n (2n + 1) / (4 pi (1 + Lambda n(n + 1))^alpha) makes the marginal variance
+    sigma^2. On a mesh log|Q| has no closed form: every likelihood evaluation factors L, assembled in the
+    sparsity pattern of Q_c so that SuperLU_DIST reuses one symbolic factorization for both, before Q_c.
+    Q^-1 rhs = tau^-2 (L^-1 C)^(alpha - 1) L^-1 rhs needs the factorization of L, which pdbridge holds
+    only until Q_c is factored: the solves of the gradient (fixed probes) are done then and cached, and
+    the Fisher information refactors L and Q_c once each. The samples of the variance estimator use a
+    square root F of Q (F F' = Q) of sparse products: F = tau (L C^-1)^k C^1/2 for alpha = 2k and
+    F = tau (L C^-1)^k [C^1/2, sqrt(Lambda) B'] for alpha = 2k + 1, with G = B'B (B the gradient
+    operator of the elements). The covariance blocks of the estimator are those of the 3 nodes of every
+    triangle, conditioned on the triangle and the neighbours of its nodes (rb_ring = 1) or on the
+    triangle alone (rb_ring = 0). The parameter vector is [log s^2, log sigma^2, log l^2].
+    """
+
+    def __init__(self, level=7, nu=1.0, noise_variance=1e-6, amplitude=1.0, lengthscale=0.1, nsamples=128,
+                 batch=32, rb_ring=1, nprobe=64, seed=0, verbose=0, INT64=0, algo3d=0, **ignored):
+        self.ndim = 3
+        self.nu = 1.0 if nu is None else float(nu)
+        alpha = self.nu + 1.0
+        if self.nu <= 0 or abs(alpha - round(alpha)) > 1e-12:
+            raise ValueError("SphereINLAGP: the smoothness nu must be a positive integer (nu = 1, 2, 3), got %g" % self.nu)
+        self.alpha = int(round(alpha))
+        self._polynomial = _smoothness_polynomial(self.alpha)
+        self.isotropic = True
+        lengthscale = float(np.ravel(lengthscale)[0])
+        self._params = np.array([np.log(noise_variance), np.log(amplitude), np.log(lengthscale ** 2)])
+        self.kernel = _INLAKernel(3, len(self._params))
+        self.level = int(level)
+        if self.level < 0 or self.level > 10:
+            raise ValueError("SphereINLAGP: the subdivision level must be between 0 and 10, got %d" % self.level)
+        self.shape = None
+        self.bounds = None
+        self.buffer = 0.0
+        self.buffer_ratio = 1.0
+        self.nsamples = int(nsamples)
+        self.batch = int(batch)
+        self.rb_ring = int(rb_ring)
+        self.nprobe = int(nprobe)
+        self.seed = seed
+        self.verbose = verbose
+        self.INT64 = INT64
+        self.algo3d = algo3d
+        self._x = None
+        self._yerr2 = 0.0
+        self._factor_id = None
+        self._factor_params = None
+        self._xhat = None
+        self._blocks = None
+        self._block_structure = None
+        self._L_params = None  # parameters of the last factorization of L (and its log-determinant)
+        self._L_factor_id = None
+        self._prior_probe_cache = None  # (parameters, A' probes, Q^-1 A' probes)
+
+    # ------------------------------------------------------------------ parameters
+
+    def _hyperparameters(self, params=None):
+        """s^2 (with the jitter), sigma^2, tau^2 and [Lambda]; also sets d log tau^2 / d log Lambda."""
+        p = self._params if params is None else params
+        s2 = np.exp(p[0]) + self._yerr2
+        sigma2 = np.exp(p[1])
+        lam = np.exp(p[2]) / (2 * self.nu)
+        total, derivative = _sphere_variance_sum(self.alpha, lam)
+        self._dlogtau2_dloglam = derivative / total
+        return s2, sigma2, total / sigma2, np.array([lam])
+
+    @property
+    def spacing(self):
+        """The mean edge length of the mesh (chordal units)."""
+        return np.array([self._spacing])
+
+    # ------------------------------------------------------------------ mesh
+
+    def compute(self, x, nns=None, yerr=0.0, **kwargs):
+        """
+        Build the mesh, the barycentric interpolation matrix of the inputs x (nsamples, 3), projected
+        radially onto the sphere, and the matrices whose linear combinations are L and Q_c.
+        """
+        start = time.time()
+        x = np.atleast_2d(np.asarray(x, dtype=float))
+        if x.shape[1] != 3:
+            raise ValueError("SphereINLAGP: the inputs must be 3D points on the unit sphere, got %d dimensions" % x.shape[1])
+        self._x = x
+        self._yerr2 = float(yerr) ** 2
+        v, t = _icosphere(self.level)
+        self._vertices, self._triangles = v, t
+        n = len(v)
+        self._n = n
+        mass, stiff, gradient = _fem_sphere(v, t)
+        self._mass = mass
+        self._stiff = stiff
+        self._gradient = gradient
+        self._cdiag = mass
+        self._logdet_c = np.sum(np.log(mass))
+        edges = np.unique(np.sort(np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]]), axis=1), axis=0)
+        self._spacing = float(np.mean(np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)))
+
+        # the triangles around every vertex and the neighbours of every vertex (padded with -1)
+        from scipy.spatial import cKDTree
+        self._tree = cKDTree(v)
+        self._star = self._padded_lists(t.ravel(), np.repeat(np.arange(len(t)), 3), n)
+        self._neighbours = self._padded_lists(np.concatenate([edges[:, 0], edges[:, 1]]),
+                                              np.concatenate([edges[:, 1], edges[:, 0]]), n)
+
+        # B_j = C (C^-1 G)^j, j = 0, ..., alpha: Q = tau^2 sum_j comb(alpha, j) Lambda^j B_j, L = B_0 + Lambda B_1
+        B = [diags(mass, format="csr")]
+        for _ in range(self.alpha):
+            B.append((stiff @ diags(1 / mass) @ B[-1]).tocsr())
+        self._multi_indices = [(j,) for j in range(self.alpha + 1)]
+        terms = [(("k", (j,)), B[j]) for j in range(self.alpha + 1)]
+        nodes, weights, _ = self._interpolation(x)
+        rows = np.repeat(np.arange(x.shape[0]), 3)
+        keep = weights.ravel() != 0
+        self._A = coo_matrix((weights.ravel()[keep], (rows[keep], nodes.ravel()[keep])), shape=(x.shape[0], n)).tocsr()
+        self._AtA = (self._A.T @ self._A).tocsr()
+        terms.append(("data", self._AtA))
+        self._set_terms(terms)
+        self._block_structure = None
+        self._L_params = None
+        self._prior_probe_cache = None
+        if self.verbose:
+            print("INLA sphere mesh: icosahedron level %d, %d nodes, %d triangles, mean edge %.4f, %d nonzeros in Q_c "
+                  "(alpha %d), %.2f s" % (self.level, n, len(t), self._spacing, len(self._keys), self.alpha, time.time() - start))
+
+    @staticmethod
+    def _padded_lists(keys, values, n):
+        """The values of every key 0..n-1 as the rows of an array padded with -1."""
+        order = np.argsort(keys, kind="stable")
+        keys, values = keys[order], values[order]
+        counts = np.bincount(keys, minlength=n)
+        starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        out = np.full((n, counts.max()), -1, dtype=np.int64)
+        out[keys, np.arange(len(keys)) - starts[keys]] = values
+        return out
+
+    def _barycentric(self, t, candidates):
+        """
+        The unnormalized barycentric coordinates (npoints, ncandidates, 3) of the points t in the planes
+        of the candidate triangles (-1: none), along the rays from the origin: t = sum_i w_i p_i.
+        """
+        valid = candidates >= 0
+        P = self._vertices[self._triangles[np.where(valid, candidates, 0)]]  # (npoints, ncand, vertex, xyz)
+        w = np.linalg.solve(np.swapaxes(P, 2, 3), np.broadcast_to(t[:, None, :, None], P.shape[:2] + (3, 1)))[..., 0]
+        w[~valid] = -np.inf
+        return w
+
+    def _interpolation(self, t):
+        """The nodes (npoints, 3), barycentric weights and triangles of the radial projections of the points t."""
+        t = np.atleast_2d(np.asarray(t, dtype=float))
+        t = t / np.linalg.norm(t, axis=1)[:, None]
+        _, nearest = self._tree.query(t)
+        candidates = self._star[nearest]
+        w = self._barycentric(t, candidates)
+        inside = np.all(w >= -1e-9, axis=2)
+        found = inside.any(axis=1)
+        choice = np.argmax(inside, axis=1)
+        if not found.all():
+            # the containing triangle is not around the nearest vertex (round-off): search the stars of
+            # the 12 nearest vertices
+            missing = np.nonzero(~found)[0]
+            _, near = self._tree.query(t[missing], k=12)
+            wide = self._star[near].reshape(len(missing), -1)
+            wm = self._barycentric(t[missing], wide)
+            inside_m = np.all(wm >= -1e-7, axis=2)
+            if not inside_m.any(axis=1).all():
+                raise ValueError("SphereINLAGP: no triangle found for %d points" % np.sum(~inside_m.any(axis=1)))
+            best = np.argmax(inside_m, axis=1)
+            candidates = candidates.copy()
+            candidates[missing, 0] = wide[np.arange(len(missing)), best]
+            w[missing, 0] = wm[np.arange(len(missing)), best]
+            choice[missing] = 0
+        cells = candidates[np.arange(len(t)), choice]
+        weights = w[np.arange(len(t)), choice]
+        weights = np.maximum(weights, 0.0)
+        weights /= weights.sum(axis=1)[:, None]
+        weights[weights < 1e-12] = 0.0
+        weights /= weights.sum(axis=1)[:, None]
+        return self._triangles[cells], weights, cells
+
+    # ------------------------------------------------------------------ likelihood
+
+    def _assemble_L(self, params=None):
+        """L = C + Lambda G in the common pattern of Q_c."""
+        lam = self._hyperparameters(params)[3][0]
+        return self._combine({("k", (0,)): 1.0, ("k", (1,)): lam})
+
+    def logdet_prior(self, params=None):
+        """log|Q| = n log tau^2 + alpha log|L| - (alpha - 1) log|C| at the factored parameters."""
+        if params is not None and not np.array_equal(params, self._L_params):
+            raise ValueError("SphereINLAGP: log|Q| is available at the parameters of the last factorization of L only")
+        tau2 = self._hyperparameters()[2]
+        return self._n * np.log(tau2) + self.alpha * self._logdet_L - (self.alpha - 1) * self._logdet_c
+
+    def _factor_L(self, quiet=False):
+        """Factor L at the current parameters; its log-determinant and the solves of the gradient's probes."""
+        superlu_factor, superlu_logdet, _ = _superlu()
+        start = time.time()
+        superlu_factor(self._assemble_L(), self.INT64, self.algo3d, self.verbose == 1)
+        sign, logdet = superlu_logdet(self.verbose == 1)
+        _factorization_count[0] += 1
+        self._L_factor_id = _factorization_count[0]
+        if sign != 1:
+            self._L_params = None
+            if quiet:
+                return False
+            raise ValueError("SphereINLAGP: L is not positive definite (sign of the determinant %s)" % sign)
+        self._logdet_L = logdet
+        self._L_params = self._params.copy()
+        if self.verbose:
+            print("INLA factorization of L: %.2f s" % (time.time() - start))
+        return True
+
+    def _factor_qc(self, quiet=False):
+        """Factor Q_c at the current parameters."""
+        superlu_factor, superlu_logdet, _ = _superlu()
+        start = time.time()
+        self._qc = self._assemble()
+        superlu_factor(self._qc, self.INT64, self.algo3d, self.verbose == 1)
+        sign, logdet = superlu_logdet(self.verbose == 1)
+        _factorization_count[0] += 1
+        self._factor_id = _factorization_count[0]
+        self._factor_params = self._params.copy()
+        self._logdet_qc = logdet if sign == 1 else np.nan
+        if self.verbose:
+            print("INLA factorization of Q_c: %.2f s" % (time.time() - start))
+        if sign != 1:
+            if quiet:
+                return False
+            raise ValueError("INLA: Q_c is not positive definite (sign of the determinant %s)" % sign)
+        return True
+
+    def recompute(self, quiet=False, **kwargs):
+        """
+        Factor L (unless its log-determinant is known at the current parameters), solving for the
+        probes of the gradient meanwhile, then Q_c (unless it is the current factorization).
+        """
+        if self._x is None:
+            raise RuntimeError("You need to compute the model first")
+        if self.computed:
+            return True
+        if self._L_params is None or not np.array_equal(self._L_params, self._params):
+            if not self._factor_L(quiet=quiet):
+                return False
+            probes, _ = self._probes(self._A.shape[0])
+            lifted = self._A.T @ probes
+            self._prior_probe_cache = (self._params.copy(), lifted, self._prior_solve(lifted))
+        return self._factor_qc(quiet=quiet)
+
+    def _solve(self, rhs):
+        """Q_c^-1 rhs, refactoring Q_c if L was factored since."""
+        if self._factor_id != _factorization_count[0]:
+            self._factor_qc()
+        return INLAGP._solve(self, rhs)
+
+    def _prior_solve(self, rhs):
+        """Q^-1 rhs = tau^-2 (L^-1 C)^(alpha - 1) L^-1 rhs: the cached probe solves, or with L refactored."""
+        rhs = np.asarray(rhs, dtype=float)
+        cache = self._prior_probe_cache
+        if (cache is not None and np.array_equal(cache[0], self._params) and cache[1].shape == rhs.shape
+                and np.array_equal(cache[1], rhs)):
+            return cache[2]
+        if self._L_factor_id != _factorization_count[0] or not np.array_equal(self._L_params, self._params):
+            self._factor_L()
+        tau2 = self._hyperparameters()[2]
+        x = INLAGP._solve(self, rhs)
+        c = self._mass.reshape((-1,) + (1,) * (rhs.ndim - 1))
+        for _ in range(self.alpha - 1):
+            x = INLAGP._solve(self, c * x)
+        return x / tau2
+
+    def _prior_sqrt(self, z):
+        """F z with F F' = Q; z has n rows for an even alpha, n + 3 ntriangles for an odd one."""
+        _, _, tau2, lam = self._hyperparameters()
+        n = self._n
+        sqrt_c = np.sqrt(self._mass).reshape((-1,) + (1,) * (z.ndim - 1))
+        x = sqrt_c * z[:n]
+        if self.alpha % 2 == 1:
+            x = x + np.sqrt(lam[0]) * (self._gradient.T @ z[n:])
+        L = diags(self._mass) + lam[0] * self._stiff
+        for _ in range(self.alpha // 2):
+            x = L @ (x / self._mass.reshape(sqrt_c.shape))
+        return np.sqrt(tau2) * x
+
+    def _sqrt_size(self):
+        """The length of the standard normal vector z of _prior_sqrt."""
+        return self._n + (3 * len(self._triangles) if self.alpha % 2 == 1 else 0)
+
+    def _precision_derivatives(self):
+        """dQ with respect to log sigma^2 (tau^2 proportional to 1 / sigma^2) and log l^2 = log Lambda + const."""
+        _, _, tau2, lam = self._hyperparameters()
+        prior = self._prior_coefficients(tau2, lam)
+        dlog = self._dlogtau2_dloglam
+        return [self._combine({name: -coef for name, coef in prior.items()}),
+                self._combine({name: coef * (name[1][0] + dlog) for name, coef in prior.items()})]
+
+    def fisher_information(self, quiet=False):
+        """
+        As INLAGP.fisher_information, ordered so that the factorizations alternate once: the solves with
+        Q_c of the probes, every application of Q^-1 (refactoring L), then the solves with Q_c (refactored).
+        """
+        try:
+            if not self.recompute(quiet=quiet):
+                return np.full((len(self._params), len(self._params)), np.nan)
+            s2 = self._hyperparameters()[0]
+            w = 1 / s2
+            A = self._A
+            noise = np.exp(self._params[0])
+            probes, weight = self._probes(A.shape[0])
+            solved = w * probes - w * w * (A @ self._solve(A.T @ probes))
+            derivatives = self._precision_derivatives()
+
+            def dS(V, dQ):
+                return -(A @ self._prior_solve(dQ @ self._prior_solve(A.T @ V)))
+
+            W = [noise * solved] + [dS(solved, dQ) for dQ in derivatives]
+            T = [noise * probes] + [dS(probes, dQ) for dQ in derivatives]
+            S = [w * V - w * w * (A @ self._solve(A.T @ V)) for V in T]
+            F = np.array([[0.5 * weight * np.sum(Wi * Sj) for Sj in S] for Wi in W])
+        except (ValueError, np.linalg.LinAlgError):
+            if quiet:
+                return np.full((len(self._params), len(self._params)), np.nan)
+            raise
+        return 0.5 * (F + F.T)
+
+    # ------------------------------------------------------------------ prediction
+
+    def _blocks_structure(self):
+        """
+        The conditioning blocks of the triangles, grouped by size: for every group, the triangles, their
+        block nodes (ntri, size), the rows of the triangle nodes in the block and the positions in the
+        pattern of the (size, size) entries of Q_c (-1: zero). Cached: the pattern is fixed.
+        """
+        if self._block_structure is not None:
+            return self._block_structure
+        t = self._triangles
+        n = self._n
+        members = t.copy()
+        for _ in range(self.rb_ring):
+            # the members and their neighbours, without the duplicates (moved to the end as n)
+            ring = self._neighbours[np.where(members < n, members, 0)]
+            ring[members >= n] = -1
+            members = np.concatenate([members, ring.reshape(len(t), -1)], axis=1)
+            members = np.sort(np.where(members < 0, n, members), axis=1)
+            duplicate = np.concatenate([np.zeros((len(t), 1), dtype=bool), members[:, 1:] == members[:, :-1]], axis=1)
+            members[duplicate] = n
+            members = np.sort(members, axis=1)
+            members = members[:, :np.max(np.sum(members < n, axis=1))]
+        sizes = np.sum(members < n, axis=1)
+        groups = []
+        for size in np.unique(sizes):
+            which = np.nonzero(sizes == size)[0]
+            nodes = members[which, :size]
+            rows = np.argmax(nodes[:, None, :] == t[which][:, :, None], axis=2)
+            # the positions of the (size, size) entries, by chunks of triangles (bounded temporaries)
+            pos = np.empty((len(which), size, size), dtype=np.int32)
+            chunk = max(1, 2 ** 24 // (size * size))
+            for c0 in range(0, len(which), chunk):
+                nd = nodes[c0:c0 + chunk]
+                pos[c0:c0 + chunk] = self._positions(np.repeat(nd, size, axis=1).ravel(),
+                                                     np.tile(nd, (1, size)).ravel()).reshape(len(nd), size, size)
+            groups.append((which, nodes, rows, pos))
+        self._block_structure = groups
+        return groups
+
+    def _covariance_blocks(self, y):
+        """The Rao-Blackwellized estimates of the posterior covariance blocks of the triangles (ntriangles, 3, 3)."""
+        y = np.ravel(np.asarray(y, dtype=float))
+        if self._blocks is not None and self._blocks[0] == self._factor_id and np.array_equal(self._blocks[1], y):
+            return self._blocks[2]
+        self.recompute()
+        start = time.time()
+        s2 = self._hyperparameters()[0]
+        groups = self._blocks_structure()
+        qc = self._qc
+        values = np.append(qc.data, 0.0)
+        ntri = len(self._triangles)
+        rng = np.random.default_rng(self.seed)
+        exact = np.empty((ntri, 3, 3))
+        second = np.zeros((ntri, 3, 3))
+        done = 0
+        while done < self.nsamples:
+            nrhs = min(self.batch, self.nsamples - done)
+            rhs = self._prior_sqrt(rng.standard_normal((self._sqrt_size(), nrhs)))
+            rhs += self._A.T @ rng.standard_normal((self._A.shape[0], nrhs)) / np.sqrt(s2)
+            samples = self._solve(rhs)
+            product = qc @ samples
+            for which, nodes, rows, pos in groups:
+                size = nodes.shape[1]
+                chunk = max(1, 2 ** 22 // (size * max(size, nrhs)))
+                for c0 in range(0, len(which), chunk):
+                    sl = slice(c0, c0 + chunk)
+                    idx = which[sl]
+                    nd = nodes[sl]
+                    rw = rows[sl]
+                    inverse = np.linalg.inv(values[pos[sl]])
+                    inverse = np.take_along_axis(inverse, rw[:, :, None], axis=1)  # the rows of the triangle nodes
+                    if done == 0:
+                        exact[idx] = np.take_along_axis(inverse, rw[:, None, :], axis=2)
+                    z = inverse @ product[nd] - samples[np.take_along_axis(nd, rw, axis=1)]
+                    second[idx] += z @ z.transpose(0, 2, 1)
+            done += nrhs
+        blocks = exact + second / self.nsamples
+        self._blocks = (self._factor_id, y.copy(), blocks)
+        if self.verbose:
+            print("INLA covariance blocks of %d triangles from %d samples: %.2f s" % (ntri, self.nsamples, time.time() - start))
+        return blocks
