@@ -10,7 +10,7 @@ from scipy.sparse.linalg import splu
 # from pdbridge import *
 from dPy_BPACK_wrapper import *
 from ..metrics import Metric
-from ..kernels import Product, ConstantKernel, ExpSquaredKernel
+from ..kernels import Product, ConstantKernel, ExpSquaredKernel, ExpKernel, Matern32Kernel, Matern52Kernel
 import copy
 import scipy
 import time
@@ -65,12 +65,18 @@ class BasicSolver(object):
     # The entry evaluator of the GPU backends (payload["gpu_entry"], registered by
     # Py_BPACK_worker.py; doc/gpu_kernels.md): K or one of its hyperparameter derivatives,
     # selected by params[1] (mode): with s_d the inverse squared length scales of the
-    # coordinates passed to butterflypack, t_d = s_d (x_d - y_d)^2, q = sum_d t_d and
-    # e = amplitude exp(-q/2),
-    #   mode 0: e, plus yerr_i^2 when i == j      (the kernel K)
-    #   mode 1: e                                 (d K / d log_constant)
-    #   mode 2+d: e t_d / 2                       (d K / d log_M_d, axis-aligned metrics)
-    #   mode 5: e q / 2                           (d K / d log_M, isotropic metrics)
+    # coordinates passed to butterflypack, t_d = s_d (x_d - y_d)^2, q = sum_d t_d (r^2 of the
+    # george kernels) and A the amplitude, the kernel k(q) and g(q) = -dk/dq are
+    #   squared exponential: k = A exp(-q/2),                      g = k/2
+    #   exponential:         k = A exp(-a), a = sqrt(q),           g = k/(2a) (0 at a = 0)
+    #   Matern-3/2:          k = A (1 + a) exp(-a), a = sqrt(3q),  g = 3/2 A exp(-a)
+    #   Matern-5/2:          k = A (1 + a + a^2/3) exp(-a), a = sqrt(5q),
+    #                        g = 5/6 A (1 + a) exp(-a)
+    # and, since d q / d log_M_d = -t_d,
+    #   mode 0: k, plus yerr_i^2 when i == j      (the kernel K)
+    #   mode 1: k                                 (d K / d log_constant)
+    #   mode 2+d: g t_d                           (d K / d log_M_d, axis-aligned metrics)
+    #   mode 5: g q                               (d K / d log_M, isotropic metrics)
     _BPACK_GPU_ENTRY_SOURCE = r"""
 __device__ double bpack_entry(const double* x, long long i, const double* y, long long j,
                               const double* params, int dim) {
@@ -91,22 +97,93 @@ __device__ double bpack_entry(const double* x, long long i, const double* y, lon
     return 0.5 * v * params[mode] * t * t;
 }
 """
+    _BPACK_GPU_ENTRY_SOURCE_EXP = r"""
+__device__ double bpack_entry(const double* x, long long i, const double* y, long long j,
+                              const double* params, int dim) {
+    const int mode = (int)params[1];
+    double q = 0.0;
+    for (int d = 0; d < dim; ++d) {
+        const double t = x[d] - y[d];
+        q += params[2 + d] * t * t;
+    }
+    const double a = sqrt(q);
+    const double e = params[0] * exp(-a);
+    if (mode <= 1) {
+        double v = e;
+        if (mode == 0 && i == j) v += params[2 + dim + i];
+        return v;
+    }
+    if (a == 0.0) return 0.0;
+    const double g = 0.5 * e / a;
+    if (mode == 5) return g * q;
+    const double t = x[mode - 2] - y[mode - 2];
+    return g * params[mode] * t * t;
+}
+"""
+    _BPACK_GPU_ENTRY_SOURCE_MATERN32 = r"""
+__device__ double bpack_entry(const double* x, long long i, const double* y, long long j,
+                              const double* params, int dim) {
+    const int mode = (int)params[1];
+    double q = 0.0;
+    for (int d = 0; d < dim; ++d) {
+        const double t = x[d] - y[d];
+        q += params[2 + d] * t * t;
+    }
+    const double a = sqrt(3.0 * q);
+    const double e = params[0] * exp(-a);
+    if (mode <= 1) {
+        double v = (1.0 + a) * e;
+        if (mode == 0 && i == j) v += params[2 + dim + i];
+        return v;
+    }
+    const double g = 1.5 * e;
+    if (mode == 5) return g * q;
+    const double t = x[mode - 2] - y[mode - 2];
+    return g * params[mode] * t * t;
+}
+"""
+    _BPACK_GPU_ENTRY_SOURCE_MATERN52 = r"""
+__device__ double bpack_entry(const double* x, long long i, const double* y, long long j,
+                              const double* params, int dim) {
+    const int mode = (int)params[1];
+    double q = 0.0;
+    for (int d = 0; d < dim; ++d) {
+        const double t = x[d] - y[d];
+        q += params[2 + d] * t * t;
+    }
+    const double a = sqrt(5.0 * q);
+    const double e = params[0] * exp(-a);
+    if (mode <= 1) {
+        double v = (1.0 + a + a * a / 3.0) * e;
+        if (mode == 0 && i == j) v += params[2 + dim + i];
+        return v;
+    }
+    const double g = (5.0 / 6.0) * (1.0 + a) * e;
+    if (mode == 5) return g * q;
+    const double t = x[mode - 2] - y[mode - 2];
+    return g * params[mode] * t * t;
+}
+"""
 
     def _bpack_gpu_entry(self, x, yerr, gid, geometry_scale):
         """
         The GPU entry evaluator of the kernel for butterflypack's GPU backends, as CUDA source
         text the library compiles with NVRTC (payload["gpu_entry"], doc/gpu_kernels.md): a
-        constant times an axis-aligned or isotropic squared exponential of the coordinates
-        passed to butterflypack (the points times geometry_scale), for gid = 0 with yerr^2 on
-        the diagonal, else its derivative in parameter gid-1 of the kernel. None if the kernel
-        has no such form.
+        constant times an axis-aligned or isotropic squared exponential, exponential,
+        Matern-3/2 or Matern-5/2 kernel of the coordinates passed to butterflypack (the points times
+        geometry_scale), for gid = 0 with yerr^2 on the diagonal, else its derivative in
+        parameter gid-1 of the kernel. None if the kernel has no such form.
         """
         ndim = x.shape[1]
         if ndim > 3:
             return None
         parts = [self.kernel.k1, self.kernel.k2] if isinstance(self.kernel, Product) else [self.kernel]
         constants = [k for k in parts if isinstance(k, ConstantKernel)]
-        squared = [k for k in parts if isinstance(k, ExpSquaredKernel)]
+        sources = {ExpSquaredKernel: self._BPACK_GPU_ENTRY_SOURCE,
+                   ExpKernel: self._BPACK_GPU_ENTRY_SOURCE_EXP,
+                   Matern32Kernel: self._BPACK_GPU_ENTRY_SOURCE_MATERN32,
+                   Matern52Kernel: self._BPACK_GPU_ENTRY_SOURCE_MATERN52}
+        squared = [k for k in parts if type(k) in sources]
         if len(squared) != 1 or len(constants) + 1 != len(parts) or squared[0].block is not None:
             return None
         metric = squared[0].metric
@@ -130,7 +207,7 @@ __device__ double bpack_entry(const double* x, long long i, const double* y, lon
         params = [amplitude, float(mode)] + inverse_metric.tolist()
         if mode == 0:
             params = np.concatenate((params, np.atleast_1d(yerr).astype(np.float64)**2 * np.ones(x.shape[0])))
-        return {"source": self._BPACK_GPU_ENTRY_SOURCE, "params": params,
+        return {"source": sources[type(squared[0])], "params": params,
                 "flags": 3}  # BPACK_GPU_SYMMETRIC | BPACK_GPU_COORDINATES
 
     def _bpack_geometry_scale(self, ndim):
@@ -299,19 +376,25 @@ __device__ double bpack_entry(const double* x, long long i, const double* y, lon
         # hyperparameters where the compression breaks down, which the sign of the determinant
         # reports.  The log-determinant itself is legitimately negative (every eigenvalue of a
         # covariance matrix with a small nugget is below one), so the sign is the only usable
-        # signal; it is recorded here so that a sampler can reject such a state.
+        # signal; it is recorded here so that a sampler can reject such a state. The value used is
+        # log|det K| whatever the sign: multiplying it by the sign (as before) negated the
+        # log-determinant whenever a solver reported a negative sign, which butterflypack's logdet
+        # did for SPD matrices at some sizes (its factorization's own logdet had the sign 1 and the
+        # same magnitude), and the likelihood then disagreed with its gradient.
         self.log_determinant_sign = 1.0
         if self.model_bpack == 1:
             sign,logdet = bpack_logdet(fid=0)
             self.log_determinant_sign = sign
-            log_det = sign*logdet            
+            if sign < 0 and self.verbose == 1:
+                print("bpack logdet: negative determinant sign reported (log|det| %.10e used)" % logdet)
+            log_det = logdet
         else:    
             if self.model_sparse == 1:
                 # For sparse K, splu doesn't provide logdet. Use slogdet instead. 
                 # sign, logdet = np.linalg.slogdet(K.toarray())
                 sign,logdet = superlu_logdet(self.verbose)
                 self.log_determinant_sign = sign
-                log_det = sign*logdet
+                log_det = logdet  # log|det K| (see above)
             else:
                 # For dense K
                 log_det = 2 * np.sum(np.log(np.diag(self._factor[0])))
