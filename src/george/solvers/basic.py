@@ -25,7 +25,7 @@ class BasicSolver(object):
         the kernel function.
 
     """
-    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, model_bpack=0, debug=0, sym=0, nprobe=10, bpack_scaled_geometry=0):
+    def __init__(self, kernel, verbose=0, INT64=0, algo3d=0, compute_grad=0, model_sparse=0, model_bpack=0, debug=0, sym=0, nprobe=10, bpack_scaled_geometry=0, bpack_s_op=1):
         self.kernel = kernel
         self.nprobe = nprobe # number of random probe vectors for the trace terms of the sparse gradient
         self._computed = False
@@ -39,6 +39,7 @@ class BasicSolver(object):
         self.model_sparse = model_sparse
         self.model_bpack = model_bpack
         self.bpack_scaled_geometry = bpack_scaled_geometry # whether to divide each dimension of the points passed to butterflypack by the kernel length scale
+        self.bpack_s_op = bpack_s_op # whether to give each butterflypack H2 matrix the absolute floor of its ID rank rule (H2_s_op, see _bpack_s_op)
         self.Kg = None
         self.K = None
 
@@ -210,6 +211,50 @@ __device__ double bpack_entry(const double* x, long long i, const double* y, lon
         return {"source": sources[type(squared[0])], "params": params,
                 "flags": 3}  # BPACK_GPU_SYMMETRIC | BPACK_GPU_COORDINATES
 
+    # The largest entry of the length-scale derivative operators g t_d and g q (the GPU sources above),
+    # max_q q g(q), in units of the amplitude: squared exponential 1/e (at r = sqrt(2)), exponential
+    # 1/(2e) (r = 1), Matern-3/2 2/e^2 (r = 2/sqrt(3)), Matern-5/2 (1+sqrt(3))^2 (2+sqrt(3))
+    # exp(-1-sqrt(3)) / 6 (r = (1+sqrt(3))/sqrt(5)). Separating two points along axis d only gives
+    # t_d = q, so every axis has the same largest entry.
+    _BPACK_DERIVATIVE_MAX_ENTRY = {
+        ExpSquaredKernel: np.exp(-1.0),
+        ExpKernel: 0.5 * np.exp(-1.0),
+        Matern32Kernel: 2.0 * np.exp(-2.0),
+        Matern52Kernel: (1.0 + np.sqrt(3.0))**2 * (2.0 + np.sqrt(3.0)) * np.exp(-1.0 - np.sqrt(3.0)) / 6.0,
+    }
+
+    def _bpack_s_op(self, yerr, gid):
+        """
+        butterflypack's H2_s_op of one matrix (bpack_s_op=1): every H2 ID then keeps a column while
+        |R_kk| > max(tol_comp |R_11|, tol_comp s_op), so blocks negligible next to the matrix get rank 0
+        instead of being compressed to tol_comp of their own size. s_op is in the units of the entries:
+          gid = 0, the factorization of K: min(yerr^2), the smallest diagonal term (the white noise and
+            the jitter), a lower bound of K's smallest eigenvalue 1/||K^-1||, which the solves and the
+            log-determinant are accurate against;
+          gid > 0, the compression-only derivative in kernel parameter gid-1: its largest entry (at most
+            its norm), the amplitude for log_constant and the amplitude times
+            _BPACK_DERIVATIVE_MAX_ENTRY for log_M.
+        0 (the relative rule only) when bpack_s_op is 0 or the kernel is not a constant times one of
+        the kernels of _bpack_gpu_entry.
+        """
+        if not self.bpack_s_op:
+            return 0.0
+        if gid == 0:
+            return float(np.min(np.atleast_1d(yerr).astype(np.float64)**2))
+        parts = [self.kernel.k1, self.kernel.k2] if isinstance(self.kernel, Product) else [self.kernel]
+        constants = [k for k in parts if isinstance(k, ConstantKernel)]
+        stationary = [k for k in parts if type(k) in self._BPACK_DERIVATIVE_MAX_ENTRY]
+        if len(stationary) != 1 or len(constants) + 1 != len(parts):
+            return 0.0
+        # (a ConstantKernel is ndim exp(log_constant): take its value)
+        amplitude = float(np.prod([k.get_value(np.zeros((1, k.ndim)))[0, 0] for k in constants]))
+        name = self.kernel.get_parameter_names(include_frozen=True)[gid-1]
+        if name.endswith("log_constant"):
+            return amplitude
+        if ":log_M_" in name:
+            return amplitude * float(self._BPACK_DERIVATIVE_MAX_ENTRY[type(stationary[0])])
+        return 0.0
+
     def _bpack_geometry_scale(self, ndim):
         """The per-dimension scaling of the coordinates passed to butterflypack (1 unless bpack_scaled_geometry)."""
         if self.bpack_scaled_geometry == 1:
@@ -287,6 +332,10 @@ __device__ double bpack_entry(const double* x, long long i, const double* y, lon
             gpu_entry = self._bpack_gpu_entry(x, yerr, 0, self._bpack_geometry_scale(x.shape[1]))
             if gpu_entry is not None:
                 payload["gpu_entry"] = gpu_entry
+            # this matrix's H2_s_op (the same as bpack_factor(..., h2_s_op=); ignored by HODLR)
+            payload["_butterflypack_H2_s_op"] = self._bpack_s_op(yerr, 0)
+            if(self.verbose==1 and self.bpack_s_op):
+                print("bpack H2_s_op: K %.3e" % payload["_butterflypack_H2_s_op"])
             bpack_factor(payload, fid=0)
             end = time.time()
             if(self.verbose==1):
@@ -304,7 +353,11 @@ __device__ double bpack_entry(const double* x, long long i, const double* y, lon
                     gpu_entry = self._bpack_gpu_entry(x, yerr, g+1, self._bpack_geometry_scale(x.shape[1]))
                     if gpu_entry is not None:
                         payload["gpu_entry"] = gpu_entry
-                    bpack_factor(payload, nofactor=True, fid=g+1)                    
+                    payload["_butterflypack_H2_s_op"] = self._bpack_s_op(yerr, g+1)
+                    if(self.verbose==1 and self.bpack_s_op):
+                        print("bpack H2_s_op: d K / d %s %.3e" % (self.kernel.get_parameter_names(include_frozen=True)[g],
+                                                                  payload["_butterflypack_H2_s_op"]))
+                    bpack_factor(payload, nofactor=True, fid=g+1)
                 end = time.time()
                 if(self.verbose==1):
                     print(f"Time spent in compress Kgs: {end - start} seconds")
